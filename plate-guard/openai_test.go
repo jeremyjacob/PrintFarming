@@ -31,6 +31,16 @@ func TestOpenAIAssessUsesVisionAndStructuredOutput(t *testing.T) {
 		if !strings.Contains(requestJSON, `json_schema`) {
 			t.Fatalf("request did not contain a JSON schema: %s", requestJSON)
 		}
+		for _, required := range []string{
+			`normal fixed-camera view`,
+			`full perimeter`,
+			`toolhead`,
+			`do not demand a full top-down view`,
+		} {
+			if !strings.Contains(requestJSON, required) {
+				t.Fatalf("plate-clear request missing %q: %s", required, requestJSON)
+			}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "completed",
 			"output": []any{

@@ -7,7 +7,7 @@ The queue-release path fails closed:
 - It verifies Bambuddy's global `require_plate_clear` setting before accepting webhooks and again before release.
 - It authenticates each webhook and binds it to the path printer, printer name, normalized print name, and latest terminal queue-job ID, status, and timestamp.
 - It analyzes two newly captured camera snapshots. The finish photo embedded in the webhook is not used as release evidence.
-- Both OpenAI assessments must show a visible, empty plate at or above the confidence threshold.
+- Both OpenAI assessments must find the normal fixed-camera view usable and show no retained part or obstruction at or above the confidence threshold. A full view of every plate edge is not required.
 - Camera, OpenAI, Bambuddy, timeout, stale-event, and uncertain-result failures do not send a clear request.
 - It queries completed, failed, cancelled, aborted, and skipped queue jobs, then rechecks the same successful terminal job and printer gate immediately before calling Bambuddy's `clear-plate` endpoint.
 

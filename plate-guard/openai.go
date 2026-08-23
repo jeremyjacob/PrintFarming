@@ -11,9 +11,9 @@ import (
 	"strings"
 )
 
-const plateAssessmentPrompt = `You are a conservative safety classifier for an automated FDM 3D-printer farm. Inspect the camera image and decide whether the entire printable build-plate area is clear enough to safely start another print.
+const plateAssessmentPrompt = `You are a safety classifier for an automated FDM 3D-printer farm. Inspect the printer's normal fixed-camera view and decide whether a printed part or other obstruction remains on the build plate before another print starts.
 
-Set plate_visible=false and is_empty=false if the build plate is obscured, cropped, too dark, blurry, or otherwise cannot be assessed reliably. Set is_empty=false if any printed part, loose object, substantial purge material, tool, hand, or other obstruction remains in the printable area. Normal surface texture, discoloration, and tiny harmless strands do not by themselves make a plate occupied. Never assume an ejection succeeded merely because this is a completion photo. Be conservative (is_empty=false) when uncertain.`
+This camera angle normally does not show every edge or the full perimeter of the plate. Cropped plate edges, perspective, and the printer's toolhead, gantry, or other normal mechanism in the frame do not make the view unusable. Set plate_visible=true when the normal camera view is clear enough that a retained printed part would be visible. Set plate_visible=false and is_empty=false only when darkness, severe blur, a foreign occlusion, or another image problem prevents detecting a retained part in the normal observation area. Set is_empty=false if any printed part, loose object, substantial purge material, tool, hand, or other obstruction remains on the observed build surface. Normal surface texture, discoloration, and tiny harmless strands do not by themselves make a plate occupied. Never assume an ejection succeeded merely because this is a completion photo. Be conservative (is_empty=false) when uncertain whether a visible object remains, but do not demand a full top-down view of the entire plate.`
 
 const firstLayerAssessmentPrompt = `You are a high-precision visual inspector for the first layer of an active FDM 3D print. False alarms are costly because a defective=true decision can pause a healthy print. Classify the layer as defective only when the image contains clear, direct visual evidence of a major first-layer failure that requires human intervention.
 
@@ -47,11 +47,11 @@ func (c *openAIClient) assess(ctx context.Context, image []byte, mediaType strin
 		"properties": map[string]any{
 			"plate_visible": map[string]any{
 				"type":        "boolean",
-				"description": "Whether the full printable build plate can be assessed reliably.",
+				"description": "Whether the printer's normal fixed-camera view is usable for detecting a retained printed part; the full plate perimeter need not be visible.",
 			},
 			"is_empty": map[string]any{
 				"type":        "boolean",
-				"description": "Whether the printable build plate is clear enough for another print.",
+				"description": "Whether no printed part or other obstruction is visible on the observed build surface.",
 			},
 			"confidence": map[string]any{
 				"type":        "number",
