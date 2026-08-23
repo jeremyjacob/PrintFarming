@@ -1,0 +1,74 @@
+name: Release Plate Guard
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plate-guard
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: plate-guard/go.mod
+          cache-dependency-path: plate-guard/go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build release archives
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          mkdir -p dist
+
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            platform="$os"
+            if [ "$os" = "darwin" ]; then
+              platform="macos"
+            fi
+
+            package="bambuddy-plate-guard_${version}_${platform}_${arch}"
+            mkdir -p "dist/$package"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=$version" \
+              -o "dist/$package/bambuddy-plate-guard" \
+              .
+            tar -C dist -czf "dist/$package.tar.gz" "$package"
+            rm -rf "dist/$package"
+          done
+
+          cd dist
+          sha256sum ./*.tar.gz > checksums.txt
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/*.tar.gz \
+            dist/checksums.txt \
+            --verify-tag \
+            --generate-notes \
+            --title "Bambuddy Plate Guard ${{ github.ref_name }}"

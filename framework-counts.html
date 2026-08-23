@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Framework Counts</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #fff;
+      color: #000;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      padding: 32px 20px;
+      display: grid;
+      place-items: center;
+      background: #fff;
+    }
+
+    main {
+      width: min(100%, 760px);
+    }
+
+    h1 {
+      margin: 0 0 24px;
+      font-size: clamp(2rem, 7vw, 4rem);
+      line-height: 0.95;
+      letter-spacing: -0.06em;
+      text-transform: uppercase;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      border-top: 2px solid #000;
+      border-left: 2px solid #000;
+    }
+
+    .counter {
+      padding: 18px;
+      border-right: 2px solid #000;
+      border-bottom: 2px solid #000;
+    }
+
+    .counter.complete {
+      background: #18b64b;
+    }
+
+    .label {
+      margin-bottom: 20px;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 44px 1fr 44px;
+      align-items: center;
+      gap: 8px;
+    }
+
+    button {
+      width: 44px;
+      height: 44px;
+      padding: 0;
+      border: 2px solid #000;
+      border-radius: 0;
+      background: #fff;
+      color: #000;
+      font: inherit;
+      font-size: 1.5rem;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    button:hover,
+    button:focus-visible {
+      background: #000;
+      color: #fff;
+    }
+
+    button:focus-visible {
+      outline: 3px solid #fff;
+      outline-offset: -5px;
+    }
+
+    output {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      text-align: center;
+      font-size: clamp(2rem, 8vw, 3.5rem);
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+    }
+
+    @media (max-width: 520px) {
+      body {
+        padding: 24px 14px;
+        place-items: start center;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Framework Counts</h1>
+    <div class="grid" id="counters"></div>
+  </main>
+
+  <script>
+    const labels = ["SL A", "SL B", "LS A", "LS B", "SS A", "SS B", "LL A", "LL B"];
+    const storageKey = "framework-counts-progress";
+    const targets = {
+      "SL A": 6,
+      "SL B": 6,
+      "LS A": 6,
+      "LS B": 6,
+      "SS A": 2,
+      "SS B": 2,
+      "LL A": 18,
+      "LL B": 18
+    };
+    const startingCounts = Object.fromEntries(labels.map((label) => [label, 0]));
+    let counts = startingCounts;
+
+    try {
+      counts = { ...startingCounts, ...(JSON.parse(localStorage.getItem(storageKey)) || {}) };
+    } catch {
+      counts = startingCounts;
+    }
+
+    function setCount(label, value) {
+      counts[label] = Math.min(targets[label], Math.max(0, value));
+      const output = document.querySelector(`[data-count="${label}"]`);
+      output.value = `${counts[label]} / ${targets[label]}`;
+      output.closest(".counter").classList.toggle("complete", counts[label] === targets[label]);
+      localStorage.setItem(storageKey, JSON.stringify(counts));
+    }
+
+    const counters = document.getElementById("counters");
+
+    labels.forEach((label) => {
+      const counter = document.createElement("section");
+      counter.className = "counter";
+      counter.innerHTML = `
+        <div class="label">${label}</div>
+        <div class="controls">
+          <button type="button" data-change="-1" aria-label="Decrease ${label}">&minus;</button>
+          <output data-count="${label}" aria-label="${label} count">${counts[label]} / ${targets[label]}</output>
+          <button type="button" data-change="1" aria-label="Increase ${label}">+</button>
+        </div>
+      `;
+
+      counter.classList.toggle("complete", counts[label] === targets[label]);
+
+      counter.addEventListener("click", (event) => {
+        const change = Number(event.target.dataset.change);
+        if (!change) return;
+        setCount(label, (counts[label] || 0) + change);
+      });
+
+      counters.append(counter);
+    });
+  </script>
+</body>
+</html>
