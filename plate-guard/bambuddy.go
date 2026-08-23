@@ -31,6 +31,7 @@ type bambuddySettings struct {
 type plateGateStatus struct {
 	ID                 int    `json:"id"`
 	Name               string `json:"name"`
+	Connected          bool   `json:"connected"`
 	AwaitingPlateClear bool   `json:"awaiting_plate_clear"`
 	State              string `json:"state"`
 	CurrentPrint       string `json:"current_print"`
@@ -44,6 +45,12 @@ type terminalJob struct {
 	CompletedAt time.Time
 	PlateType   string
 	Status      string
+}
+
+type activeQueueJob struct {
+	ID        int
+	StartedAt time.Time
+	Status    string
 }
 
 func newBambuddyClient(rawURL, apiKey string, timezone *time.Location, httpClient *http.Client) (*bambuddyClient, error) {
@@ -273,6 +280,58 @@ func (c *bambuddyClient) latestTerminalJob(ctx context.Context, printerID int) (
 		return terminalJob{}, fmt.Errorf("Bambuddy has no terminal queue job for printer %d", printerID)
 	}
 	return latest, nil
+}
+
+func (c *bambuddyClient) activeQueueJob(ctx context.Context, printerID int) (activeQueueJob, error) {
+	u := c.endpoint("/api/v1/queue/")
+	query := u.Query()
+	query.Set("printer_id", strconv.Itoa(printerID))
+	query.Set("status", "printing")
+	u.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return activeQueueJob{}, err
+	}
+	c.addAuthentication(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return activeQueueJob{}, fmt.Errorf("get active Bambuddy queue job: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return activeQueueJob{}, responseError("get active Bambuddy queue job", resp)
+	}
+
+	var items []struct {
+		ID        int    `json:"id"`
+		PrinterID int    `json:"printer_id"`
+		StartedAt string `json:"started_at"`
+		Status    string `json:"status"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxQueueResponseBytes)).Decode(&items); err != nil {
+		return activeQueueJob{}, fmt.Errorf("decode active Bambuddy queue jobs: %w", err)
+	}
+	var active activeQueueJob
+	for _, item := range items {
+		if item.PrinterID != printerID || strings.ToLower(item.Status) != "printing" {
+			continue
+		}
+		if active.ID != 0 {
+			return activeQueueJob{}, fmt.Errorf("Bambuddy returned multiple active queue jobs for printer %d", printerID)
+		}
+		if item.ID <= 0 || item.StartedAt == "" {
+			return activeQueueJob{}, fmt.Errorf("Bambuddy returned an invalid active queue job for printer %d", printerID)
+		}
+		startedAt, err := parseBambuddyTime(item.StartedAt, c.timezone)
+		if err != nil {
+			return activeQueueJob{}, fmt.Errorf("parse active queue job %d timestamp: %w", item.ID, err)
+		}
+		active = activeQueueJob{ID: item.ID, StartedAt: startedAt, Status: "printing"}
+	}
+	if active.ID == 0 {
+		return activeQueueJob{}, fmt.Errorf("Bambuddy has no active queue job for printer %d", printerID)
+	}
+	return active, nil
 }
 
 func isTerminalQueueStatus(status string) bool {

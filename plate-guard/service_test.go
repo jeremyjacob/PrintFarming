@@ -21,6 +21,8 @@ type fakeController struct {
 	gateCalls        int
 	terminalJobs     []terminalJob
 	terminalCalls    int
+	activeJobs       []activeQueueJob
+	activeCalls      int
 	plateClearActive bool
 	snapshotCalls    int
 	staticSnapshots  bool
@@ -63,6 +65,20 @@ func (f *fakeController) latestTerminalJob(context.Context, int) (terminalJob, e
 	}
 	f.terminalCalls++
 	return f.terminalJobs[index], nil
+}
+
+func (f *fakeController) activeQueueJob(context.Context, int) (activeQueueJob, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.activeJobs) == 0 {
+		return activeQueueJob{}, nil
+	}
+	index := f.activeCalls
+	if index >= len(f.activeJobs) {
+		index = len(f.activeJobs) - 1
+	}
+	f.activeCalls++
+	return f.activeJobs[index], nil
 }
 
 func (f *fakeController) plateClearEnabled(context.Context) (bool, error) {
@@ -136,6 +152,10 @@ func firstLayerEvent(now time.Time) webhookEvent {
 	}
 }
 
+func testActiveJob(now time.Time) activeQueueJob {
+	return activeQueueJob{ID: 99, StartedAt: now.Add(-time.Minute), Status: "printing"}
+}
+
 func TestWebhookClearsOnlyConfidentEmptyPlate(t *testing.T) {
 	now := time.Now()
 	gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"}
@@ -190,10 +210,11 @@ func TestWebhookClearsOnlyConfidentEmptyPlate(t *testing.T) {
 func TestFirstLayerWebhookPausesOnlyAfterTwoCertainFailures(t *testing.T) {
 	now := time.Now()
 	controller := &fakeController{
-		paused: make(chan int, 1),
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
 		gateStatuses: []plateGateStatus{
-			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
-			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 3},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 3},
 		},
 	}
 	certainFailure := firstLayerAssessment{
@@ -241,9 +262,10 @@ func TestFirstLayerWebhookPausesOnlyAfterTwoCertainFailures(t *testing.T) {
 func TestFirstLayerAmbiguityDoesNotPause(t *testing.T) {
 	now := time.Now()
 	controller := &fakeController{
-		paused: make(chan int, 1),
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
 		gateStatuses: []plateGateStatus{{
-			ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+			ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
 		}},
 	}
 	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{{
@@ -270,9 +292,10 @@ func TestFirstLayerAmbiguityDoesNotPause(t *testing.T) {
 func TestFirstLayerFailureRequiresIndependentConfirmation(t *testing.T) {
 	now := time.Now()
 	controller := &fakeController{
-		paused: make(chan int, 1),
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
 		gateStatuses: []plateGateStatus{{
-			ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+			ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
 		}},
 	}
 	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{
@@ -299,8 +322,9 @@ func TestFirstLayerFailureRequiresDistinctSnapshots(t *testing.T) {
 	controller := &fakeController{
 		paused:          make(chan int, 1),
 		staticSnapshots: true,
+		activeJobs:      []activeQueueJob{testActiveJob(now)},
 		gateStatuses: []plateGateStatus{{
-			ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+			ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
 		}},
 	}
 	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
@@ -323,10 +347,11 @@ func TestFirstLayerFailureRequiresDistinctSnapshots(t *testing.T) {
 func TestFirstLayerDryRunRevalidatesWithoutPausing(t *testing.T) {
 	now := time.Now()
 	controller := &fakeController{
-		paused: make(chan int, 1),
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
 		gateStatuses: []plateGateStatus{
-			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
-			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 4},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 4},
 		},
 	}
 	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
@@ -351,10 +376,11 @@ func TestFirstLayerDryRunRevalidatesWithoutPausing(t *testing.T) {
 func TestFirstLayerFailureDoesNotPauseAReplacementPrint(t *testing.T) {
 	now := time.Now()
 	controller := &fakeController{
-		paused: make(chan int, 1),
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
 		gateStatuses: []plateGateStatus{
-			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
-			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "replacement.3mf", SubtaskName: "replacement.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "replacement.3mf", SubtaskName: "replacement.3mf", LayerNum: 2},
 		},
 	}
 	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
@@ -366,6 +392,60 @@ func TestFirstLayerFailureDoesNotPauseAReplacementPrint(t *testing.T) {
 	case <-controller.paused:
 		t.Fatal("a replacement print must not be paused for an earlier event")
 	default:
+	}
+}
+
+func TestFirstLayerFailureDoesNotPauseSameNameReplacementJob(t *testing.T) {
+	now := time.Now()
+	initialJob := testActiveJob(now)
+	replacementJob := activeQueueJob{ID: initialJob.ID + 1, StartedAt: now.Add(time.Second), Status: "printing"}
+	controller := &fakeController{
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{initialJob, replacementJob},
+		gateStatuses: []plateGateStatus{
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+		},
+	}
+	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{failure, failure}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("a same-name replacement queue job must not be paused for an earlier event")
+	default:
+	}
+}
+
+func TestFirstLayerDisconnectedPrinterDoesNotPause(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
+		gateStatuses: []plateGateStatus{{
+			ID: 7, Name: "P1S", Connected: false, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+		}},
+	}
+	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
+	svc := newService(
+		testConfig(),
+		controller,
+		&fakeAssessor{firstLayerAssessments: []firstLayerAssessment{failure, failure}},
+		log.New(io.Discard, "", 0),
+	)
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("a disconnected printer must not be paused from cached status")
+	default:
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.snapshotCalls != 0 || controller.activeCalls != 0 {
+		t.Fatal("disconnected status should stop before queue or vision checks")
 	}
 }
 
@@ -611,6 +691,70 @@ func TestTerminalJobMustMatchWebhookTimestampAndStatus(t *testing.T) {
 	}
 }
 
+type blockingFirstLayerAssessor struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (a *blockingFirstLayerAssessor) assess(context.Context, []byte, string) (plateAssessment, error) {
+	return plateAssessment{}, nil
+}
+
+func (a *blockingFirstLayerAssessor) assessFirstLayer(context.Context, []byte, string) (firstLayerAssessment, error) {
+	a.once.Do(func() { close(a.started) })
+	<-a.release
+	return firstLayerAssessment{}, nil
+}
+
+func TestShutdownTimeoutDoesNotWaitForStuckAssessment(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
+		gateStatuses: []plateGateStatus{{
+			ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+		}},
+	}
+	assessor := &blockingFirstLayerAssessor{started: make(chan struct{}), release: make(chan struct{})}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.start(context.Background())
+	svc.jobSlots <- struct{}{}
+	svc.jobs <- plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now}
+	select {
+	case <-assessor.started:
+	case <-time.After(time.Second):
+		t.Fatal("assessment did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	result := make(chan bool, 1)
+	go func() { result <- svc.shutdown(ctx) }()
+	select {
+	case drained := <-result:
+		if drained {
+			close(assessor.release)
+			t.Fatal("stuck assessment unexpectedly drained")
+		}
+	case <-time.After(200 * time.Millisecond):
+		close(assessor.release)
+		t.Fatal("shutdown remained blocked after its context expired")
+	}
+	close(assessor.release)
+
+	done := make(chan struct{})
+	go func() {
+		svc.workerWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("workers did not exit after the stuck assessment was released")
+	}
+}
+
 type schedulingController struct {
 	now time.Time
 }
@@ -631,6 +775,10 @@ func (c *schedulingController) gateStatus(_ context.Context, printerID int) (pla
 
 func (c *schedulingController) latestTerminalJob(_ context.Context, printerID int) (terminalJob, error) {
 	return terminalJob{ID: printerID, Status: "completed", CompletedAt: c.now.Add(-time.Second)}, nil
+}
+
+func (c *schedulingController) activeQueueJob(_ context.Context, printerID int) (activeQueueJob, error) {
+	return activeQueueJob{ID: printerID, Status: "printing", StartedAt: c.now.Add(-time.Minute)}, nil
 }
 
 func (c *schedulingController) plateClearEnabled(context.Context) (bool, error) {

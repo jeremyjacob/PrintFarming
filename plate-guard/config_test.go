@@ -73,7 +73,7 @@ func TestLoadConfigRejectsUnsafeFirstLayerThreshold(t *testing.T) {
 	t.Setenv("BAMBUDDY_URL", "http://bambuddy:8000")
 	t.Setenv("OPENAI_API_KEY", "test-openai-key")
 	t.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
-	t.Setenv("FIRST_LAYER_FAILURE_THRESHOLD", "0.94")
+	t.Setenv("FIRST_LAYER_FAILURE_THRESHOLD", "0.989")
 
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("expected an unsafe first-layer threshold to fail")

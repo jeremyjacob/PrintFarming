@@ -97,8 +97,8 @@ func loadConfig() (config, error) {
 	if math.IsNaN(cfg.EmptyConfidenceThreshold) || math.IsInf(cfg.EmptyConfidenceThreshold, 0) || cfg.EmptyConfidenceThreshold < 0 || cfg.EmptyConfidenceThreshold > 1 {
 		return config{}, fmt.Errorf("EMPTY_CONFIDENCE_THRESHOLD must be between 0 and 1")
 	}
-	if math.IsNaN(cfg.FirstLayerFailThreshold) || math.IsInf(cfg.FirstLayerFailThreshold, 0) || cfg.FirstLayerFailThreshold < 0.95 || cfg.FirstLayerFailThreshold > 1 {
-		return config{}, fmt.Errorf("FIRST_LAYER_FAILURE_THRESHOLD must be between 0.95 and 1")
+	if math.IsNaN(cfg.FirstLayerFailThreshold) || math.IsInf(cfg.FirstLayerFailThreshold, 0) || cfg.FirstLayerFailThreshold < 0.99 || cfg.FirstLayerFailThreshold > 1 {
+		return config{}, fmt.Errorf("FIRST_LAYER_FAILURE_THRESHOLD must be between 0.99 and 1")
 	}
 	if cfg.SnapshotDelay < 0 {
 		return config{}, fmt.Errorf("SNAPSHOT_DELAY cannot be negative")

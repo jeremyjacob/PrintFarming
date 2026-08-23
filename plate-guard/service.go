@@ -26,6 +26,7 @@ type plateController interface {
 	snapshot(context.Context, int) ([]byte, string, error)
 	gateStatus(context.Context, int) (plateGateStatus, error)
 	latestTerminalJob(context.Context, int) (terminalJob, error)
+	activeQueueJob(context.Context, int) (activeQueueJob, error)
 	plateClearEnabled(context.Context) (bool, error)
 	clearPlate(context.Context, int) error
 	pausePrint(context.Context, int) error
@@ -265,7 +266,6 @@ func (s *service) shutdown(ctx context.Context) bool {
 		if cancel != nil {
 			cancel()
 		}
-		<-done
 		return false
 	}
 }
@@ -386,6 +386,15 @@ func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 		s.logger.Printf("first-layer check skipped printer_id=%d: webhook does not match an active print", job.PrinterID)
 		return
 	}
+	initialJob, err := s.controller.activeQueueJob(ctx, job.PrinterID)
+	if err != nil {
+		s.logger.Printf("first-layer check skipped printer_id=%d: cannot bind event to an active queue job: %v", job.PrinterID, err)
+		return
+	}
+	if !activeJobMatchesEvent(initialJob, job.EventTime) {
+		s.logger.Printf("first-layer check skipped printer_id=%d: event predates the active queue job", job.PrinterID)
+		return
+	}
 
 	firstImage, firstMediaType, err := s.freshSnapshot(ctx, job.PrinterID, 0)
 	if err != nil {
@@ -434,6 +443,11 @@ func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 	}
 	if !sameActivePrint(initialStatus, currentStatus) {
 		s.logger.Printf("first-layer failure not actioned printer_id=%d: active print changed during assessment", job.PrinterID)
+		return
+	}
+	currentJob, err := s.controller.activeQueueJob(ctx, job.PrinterID)
+	if err != nil || !sameActiveJob(initialJob, currentJob) {
+		s.logger.Printf("first-layer failure not actioned printer_id=%d: active queue job changed during assessment", job.PrinterID)
 		return
 	}
 	if s.dryRun {
@@ -532,6 +546,7 @@ func samePlateGate(before, after plateGateStatus) bool {
 func activePrintMatchesEvent(status plateGateStatus, printerID int, event webhookEvent) bool {
 	return status.ID == printerID &&
 		status.Name == event.Printer &&
+		status.Connected &&
 		status.State == "RUNNING" &&
 		status.LayerNum >= 2 &&
 		normalizePrintName(status.CurrentPrint) != "" &&
@@ -543,6 +558,8 @@ func sameActivePrint(before, after plateGateStatus) bool {
 	return before.ID > 0 &&
 		before.ID == after.ID &&
 		before.Name == after.Name &&
+		before.Connected &&
+		after.Connected &&
 		before.State == "RUNNING" &&
 		after.State == "RUNNING" &&
 		before.CurrentPrint != "" &&
@@ -551,6 +568,18 @@ func sameActivePrint(before, after plateGateStatus) bool {
 		before.identity() == after.identity() &&
 		before.LayerNum >= 2 &&
 		after.LayerNum >= before.LayerNum
+}
+
+func activeJobMatchesEvent(job activeQueueJob, eventTime time.Time) bool {
+	return job.ID > 0 && job.Status == "printing" && !eventTime.Before(job.StartedAt)
+}
+
+func sameActiveJob(before, after activeQueueJob) bool {
+	return before.ID > 0 &&
+		before.ID == after.ID &&
+		before.Status == "printing" &&
+		after.Status == "printing" &&
+		before.StartedAt.Equal(after.StartedAt)
 }
 
 func sameTerminalJob(before, after terminalJob) bool {

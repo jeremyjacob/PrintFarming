@@ -13,11 +13,12 @@ The queue-release path fails closed:
 
 The first-layer path is deliberately conservative against false pauses:
 
-- It accepts Bambuddy's `first_layer_complete` event only when the named print is still `RUNNING` at layer 2 or later.
+- It accepts Bambuddy's `first_layer_complete` event only when the printer is connected and the named print is still `RUNNING` at layer 2 or later.
+- It binds the event to the exact active Bambuddy queue-item ID and start time. Non-queue/manual prints are not automatically paused.
 - It uses a separate high-precision failure-detection prompt on two fresh, byte-distinct snapshots.
 - Both assessments must show a visible, major physical defect at or above `FIRST_LAYER_FAILURE_THRESHOLD`.
 - Unclear images, API failures, low confidence, and disagreement let the print continue.
-- It rechecks that the same print is still running and that its layer counter has not reset immediately before requesting a pause.
+- It rechecks the connection, queue-item ID/start time, print identity, and non-reset layer counter immediately before requesting a pause.
 - It never stops, resumes, or starts a printer directly.
 
 Bambuddy 1.2.5 does not provide atomic "clear this exact gate generation" or "pause this exact print generation" operations. A manual action can theoretically change printer state between a final status check and its control request. Do not manually clear a gate or replace/resume a print while Plate Guard is processing the corresponding webhook.
@@ -59,7 +60,7 @@ Configuration is read from environment variables.
 | `EVENT_MAX_AGE` | No | `5m` | Maximum webhook and queued-job age |
 | `SNAPSHOT_DELAY` | No | `5s` | Delay before the first fresh snapshot |
 | `EMPTY_CONFIDENCE_THRESHOLD` | No | `0.95` | Minimum confidence required from each assessment |
-| `FIRST_LAYER_FAILURE_THRESHOLD` | No | `0.99` | Minimum confidence from both defect assessments; values below `0.95` are rejected |
+| `FIRST_LAYER_FAILURE_THRESHOLD` | No | `0.99` | Minimum confidence from both defect assessments; values below `0.99` are rejected |
 | `WORKER_COUNT` | No | `4` | Concurrent workers; jobs for one printer remain serialized |
 | `AUTO_ENABLE_PLATE_CLEAR` | No | `true` | Attempt to enable `require_plate_clear` during startup |
 | `DRY_RUN` | No | `false` | Analyze and revalidate without sending pause or `clear-plate` requests |

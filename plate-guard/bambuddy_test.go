@@ -44,6 +44,7 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(plateGateStatus{
 				ID:                 7,
 				Name:               "P1S",
+				Connected:          true,
 				AwaitingPlateClear: true,
 				State:              "FINISH",
 				SubtaskName:        "part",
@@ -58,8 +59,18 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 			w.Header().Set("Content-Type", "image/jpeg")
 			_, _ = w.Write([]byte{0xff, 0xd8, 0xff, 0xdb})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/queue/":
-			if r.URL.Query().Get("printer_id") != "7" || r.URL.Query().Has("status") {
+			if r.URL.Query().Get("printer_id") != "7" {
 				http.Error(w, "missing queue filters", http.StatusBadRequest)
+				return
+			}
+			if r.URL.Query().Get("status") == "printing" {
+				_ = json.NewEncoder(w).Encode([]map[string]any{
+					{"id": 45, "printer_id": 7, "status": "printing", "started_at": "2026-08-22T13:30:00Z"},
+				})
+				return
+			}
+			if r.URL.Query().Has("status") {
+				http.Error(w, "unexpected queue status", http.StatusBadRequest)
 				return
 			}
 			_ = json.NewEncoder(w).Encode([]map[string]any{
@@ -89,7 +100,7 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !status.AwaitingPlateClear || status.SubtaskName != "part" {
+	if !status.Connected || !status.AwaitingPlateClear || status.SubtaskName != "part" {
 		t.Fatalf("unexpected gate status: %+v", status)
 	}
 	terminal, err := client.latestTerminalJob(context.Background(), 7)
@@ -98,6 +109,13 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	}
 	if terminal.ID != 43 || terminal.Status != "failed" || !terminal.CompletedAt.Equal(time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)) {
 		t.Fatalf("unexpected terminal job: %+v", terminal)
+	}
+	active, err := client.activeQueueJob(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ID != 45 || active.Status != "printing" || !active.StartedAt.Equal(time.Date(2026, 8, 22, 13, 30, 0, 0, time.UTC)) {
+		t.Fatalf("unexpected active job: %+v", active)
 	}
 	image, mediaType, err := client.snapshot(context.Background(), 7)
 	if err != nil {
