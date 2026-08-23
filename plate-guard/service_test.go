@@ -135,8 +135,12 @@ func testConfig() config {
 }
 
 func testEvent(now time.Time) webhookEvent {
+	return terminalEvent("print_complete", now)
+}
+
+func terminalEvent(eventType string, now time.Time) webhookEvent {
 	return webhookEvent{
-		Event:     "print_complete",
+		Event:     eventType,
 		Printer:   "P1S",
 		Filename:  "part.3mf",
 		Timestamp: now.Format(time.RFC3339Nano),
@@ -204,6 +208,51 @@ func TestWebhookClearsOnlyConfidentEmptyPlate(t *testing.T) {
 	defer controller.mu.Unlock()
 	if controller.snapshotCalls != 2 {
 		t.Fatalf("expected two fresh snapshots, got %d", controller.snapshotCalls)
+	}
+}
+
+func TestFailedAndStoppedWebhooksCanReleaseClearGate(t *testing.T) {
+	tests := []struct {
+		eventType string
+		status    string
+	}{
+		{eventType: "print_failed", status: "failed"},
+		{eventType: "print_stopped", status: "cancelled"},
+		{eventType: "print_stopped", status: "aborted"},
+	}
+	for _, test := range tests {
+		t.Run(test.eventType+"_"+test.status, func(t *testing.T) {
+			now := time.Now()
+			gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FAILED", SubtaskName: "part.3mf"}
+			terminal := terminalJob{ID: 42, Status: test.status, CompletedAt: now.Add(-time.Second)}
+			controller := &fakeController{
+				cleared:          make(chan int, 1),
+				gateStatuses:     []plateGateStatus{gate, gate},
+				terminalJobs:     []terminalJob{terminal, terminal},
+				plateClearActive: true,
+			}
+			assessor := &fakeAssessor{assessment: plateAssessment{
+				PlateVisible: true,
+				IsEmpty:      true,
+				Confidence:   0.99,
+				Reason:       "clear",
+			}}
+			svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+			svc.processJob(context.Background(), plateJob{
+				PrinterID: 7,
+				Event:     terminalEvent(test.eventType, now),
+				EventTime: now,
+			})
+
+			select {
+			case printerID := <-controller.cleared:
+				if printerID != 7 {
+					t.Fatalf("unexpected printer ID: %d", printerID)
+				}
+			default:
+				t.Fatal("matching terminal webhook did not release a clear gate")
+			}
+		})
 	}
 }
 
@@ -679,15 +728,47 @@ func TestGateMatchesBambuddyNormalizedFilename(t *testing.T) {
 func TestTerminalJobMustMatchWebhookTimestampAndStatus(t *testing.T) {
 	now := time.Now()
 	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now}
-	if terminalMatchesEvent(terminal, now.Add(-time.Minute), 5*time.Minute) {
+	if terminalMatchesEvent(terminal, "print_complete", now.Add(-time.Minute), 5*time.Minute) {
 		t.Fatal("a webhook older than the queue completion must not match")
 	}
-	if !terminalMatchesEvent(terminal, now.Add(time.Second), 5*time.Minute) {
+	if !terminalMatchesEvent(terminal, "print_complete", now.Add(time.Second), 5*time.Minute) {
 		t.Fatal("a webhook emitted after the queue completion should match")
 	}
 	terminal.Status = "failed"
-	if terminalMatchesEvent(terminal, now.Add(time.Second), 5*time.Minute) {
+	if terminalMatchesEvent(terminal, "print_complete", now.Add(time.Second), 5*time.Minute) {
 		t.Fatal("a failed terminal job must not match a completion webhook")
+	}
+	if !terminalMatchesEvent(terminal, "print_failed", now.Add(time.Second), 5*time.Minute) {
+		t.Fatal("a failed terminal job should match a failure webhook")
+	}
+}
+
+func TestTerminalStatusMustMatchWebhookType(t *testing.T) {
+	tests := []struct {
+		status    string
+		eventType string
+		want      bool
+	}{
+		{status: "completed", eventType: "print_complete", want: true},
+		{status: "failed", eventType: "print_failed", want: true},
+		{status: "cancelled", eventType: "print_stopped", want: true},
+		{status: "aborted", eventType: "print_stopped", want: true},
+		{status: "failed", eventType: "print_stopped"},
+		{status: "cancelled", eventType: "print_failed"},
+		{status: "completed", eventType: "print_failed"},
+	}
+	for _, test := range tests {
+		if got := terminalStatusMatchesEvent(test.status, test.eventType); got != test.want {
+			t.Fatalf("terminalStatusMatchesEvent(%q, %q)=%t want %t", test.status, test.eventType, got, test.want)
+		}
+	}
+	for _, eventType := range []string{"print_complete", "print_failed", "print_stopped", "first_layer_complete"} {
+		if !isSupportedEvent(eventType) {
+			t.Fatalf("expected %q to be supported", eventType)
+		}
+	}
+	if isSupportedEvent("print_progress") {
+		t.Fatal("print_progress must remain unsupported")
 	}
 }
 

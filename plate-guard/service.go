@@ -152,7 +152,7 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if event.Event != "print_complete" && event.Event != "first_layer_complete" {
+	if !isSupportedEvent(event.Event) {
 		s.logger.Printf("ignored Bambuddy event=%q printer_id=%d", event.Event, printerID)
 		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 		return
@@ -272,7 +272,7 @@ func (s *service) shutdown(ctx context.Context) bool {
 
 func (s *service) processJob(ctx context.Context, job plateJob) {
 	switch job.Event.Event {
-	case "print_complete":
+	case "print_complete", "print_failed", "print_stopped":
 		s.processCompletion(ctx, job)
 	case "first_layer_complete":
 		s.processFirstLayer(ctx, job)
@@ -281,7 +281,7 @@ func (s *service) processJob(ctx context.Context, job plateJob) {
 
 func (s *service) processCompletion(ctx context.Context, job plateJob) {
 	if time.Since(job.EventTime) > s.eventMaxAge {
-		s.logger.Printf("ignored stale queued completion printer_id=%d", job.PrinterID)
+		s.logger.Printf("ignored stale queued event=%q printer_id=%d", job.Event.Event, job.PrinterID)
 		return
 	}
 	initialGate, err := s.controller.gateStatus(ctx, job.PrinterID)
@@ -290,7 +290,7 @@ func (s *service) processCompletion(ctx context.Context, job plateJob) {
 		return
 	}
 	if !initialGate.AwaitingPlateClear {
-		s.logger.Printf("ignored stale completion printer_id=%d: printer is not awaiting plate clear", job.PrinterID)
+		s.logger.Printf("ignored stale event=%q printer_id=%d: printer is not awaiting plate clear", job.Event.Event, job.PrinterID)
 		return
 	}
 	if initialGate.ID != job.PrinterID || initialGate.Name != job.Event.Printer {
@@ -316,8 +316,8 @@ func (s *service) processCompletion(ctx context.Context, job plateJob) {
 		s.logger.Printf("plate remains gated printer_id=%d: cannot identify terminal queue job: %v", job.PrinterID, err)
 		return
 	}
-	if !terminalMatchesEvent(initialTerminal, job.EventTime, s.eventMaxAge) {
-		s.logger.Printf("plate remains gated printer_id=%d: webhook does not match latest successful queue completion", job.PrinterID)
+	if !terminalMatchesEvent(initialTerminal, job.Event.Event, job.EventTime, s.eventMaxAge) {
+		s.logger.Printf("plate remains gated printer_id=%d: webhook does not match latest terminal queue job", job.PrinterID)
 		return
 	}
 
@@ -610,9 +610,31 @@ func normalizePrintName(value string) string {
 	return normalized.String()
 }
 
-func terminalMatchesEvent(job terminalJob, eventTime time.Time, maxAge time.Duration) bool {
+func terminalMatchesEvent(job terminalJob, eventType string, eventTime time.Time, maxAge time.Duration) bool {
 	delta := eventTime.Sub(job.CompletedAt)
-	return job.ID > 0 && job.Status == "completed" && delta >= 0 && delta <= maxAge
+	return job.ID > 0 && terminalStatusMatchesEvent(job.Status, eventType) && delta >= 0 && delta <= maxAge
+}
+
+func terminalStatusMatchesEvent(status, eventType string) bool {
+	switch eventType {
+	case "print_complete":
+		return status == "completed"
+	case "print_failed":
+		return status == "failed"
+	case "print_stopped":
+		return status == "cancelled" || status == "aborted"
+	default:
+		return false
+	}
+}
+
+func isSupportedEvent(eventType string) bool {
+	switch eventType {
+	case "print_complete", "print_failed", "print_stopped", "first_layer_complete":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *service) validAuthorization(header string) bool {

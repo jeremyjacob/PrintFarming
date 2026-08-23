@@ -1,6 +1,6 @@
 # Bambuddy Plate Guard
 
-`bambuddy-plate-guard` is a local Go service that checks first-layer quality, pauses confirmed failures, keeps Bambuddy's queue gated after a successful queued print, and releases the next print only when fresh camera images show that the build plate is confidently empty.
+`bambuddy-plate-guard` is a local Go service that checks first-layer quality, pauses confirmed failures, keeps Bambuddy's queue gated after any terminal queued print, and releases the next print only when fresh camera images show that the build plate is confidently empty.
 
 The queue-release path fails closed:
 
@@ -9,7 +9,7 @@ The queue-release path fails closed:
 - It analyzes two newly captured camera snapshots. The finish photo embedded in the webhook is not used as release evidence.
 - Both OpenAI assessments must find the normal fixed-camera view usable and show no retained part or obstruction at or above the confidence threshold. A full view of every plate edge is not required.
 - Camera, OpenAI, Bambuddy, timeout, stale-event, and uncertain-result failures do not send a clear request.
-- It queries completed, failed, cancelled, aborted, and skipped queue jobs, then rechecks the same successful terminal job and printer gate immediately before calling Bambuddy's `clear-plate` endpoint.
+- It maps completed, failed, and stopped webhooks to their exact terminal queue statuses, then rechecks the same queue job and printer gate immediately before calling Bambuddy's `clear-plate` endpoint.
 
 The first-layer path is deliberately conservative against false pauses:
 
@@ -130,12 +130,14 @@ Create one notification provider per printer:
 | Payload format | Generic |
 | Printer | The matching printer |
 | Print complete | Enabled |
+| Print failed | Enabled |
+| Print stopped | Enabled |
 | First layer complete | Enabled |
 | Other events | Disabled unless used elsewhere |
 | Quiet hours | Disabled |
 | Daily digest | Disabled |
 
-Bambuddy converts a plain Authorization value to `Bearer VALUE`; that is the format Plate Guard requires. A provider test event is accepted and ignored because only `event=print_complete` and `event=first_layer_complete` start assessments.
+Bambuddy converts a plain Authorization value to `Bearer VALUE`; that is the format Plate Guard requires. A provider test event is accepted and ignored because only `event=print_complete`, `event=print_failed`, `event=print_stopped`, and `event=first_layer_complete` start assessments.
 
 Finish-photo capture is not required. Bambuddy may include a base64 finish image, but Plate Guard intentionally ignores it and captures fresh snapshots after the configured delay.
 
@@ -200,7 +202,7 @@ The unit uses a dynamic unprivileged user, a read-only filesystem, no Linux capa
 sudo systemctl restart bambuddy-plate-guard
 ```
 
-If an assessment holds a plate, remove the obstruction and use Bambuddy's normal **Clear plate** action. Plate Guard does not retry held gates. Failed, stopped, aborted, and cancelled prints are not auto-cleared.
+If an assessment holds a plate, remove the obstruction and use Bambuddy's normal **Clear plate** action. Plate Guard does not retry held gates. Completed, failed, and stopped queue jobs are eligible for automatic release only when the webhook type matches the terminal queue status and every image and revalidation check passes.
 
 If Plate Guard pauses a first-layer failure, inspect the print and use Bambuddy's normal stop or resume control. Plate Guard never resumes automatically.
 
