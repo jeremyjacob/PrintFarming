@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -11,46 +10,42 @@ import (
 )
 
 type config struct {
-	ListenAddr               string
-	BambuddyURL              string
-	BambuddyAPIKey           string
-	OpenAIAPIKey             string
-	OpenAIBaseURL            string
-	OpenAIModel              string
-	OpenAIImageDetail        string
-	WebhookSecret            string
-	SnapshotDelay            time.Duration
-	EmptyConfidenceThreshold float64
-	FirstLayerFailThreshold  float64
-	EventMaxAge              time.Duration
-	BambuddyTimezone         *time.Location
-	WorkerCount              int
-	ShutdownTimeout          time.Duration
-	AutoEnablePlateClear     bool
-	DryRun                   bool
-	BambuddyTimeout          time.Duration
-	OpenAITimeout            time.Duration
+	ListenAddr           string
+	BambuddyURL          string
+	BambuddyAPIKey       string
+	OpenAIAPIKey         string
+	OpenAIBaseURL        string
+	OpenAIModel          string
+	OpenAIImageDetail    string
+	WebhookSecret        string
+	SnapshotDelay        time.Duration
+	EventMaxAge          time.Duration
+	BambuddyTimezone     *time.Location
+	WorkerCount          int
+	ShutdownTimeout      time.Duration
+	AutoEnablePlateClear bool
+	DryRun               bool
+	BambuddyTimeout      time.Duration
+	OpenAITimeout        time.Duration
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		ListenAddr:               envOrDefault("LISTEN_ADDR", "127.0.0.1:8787"),
-		BambuddyURL:              strings.TrimRight(os.Getenv("BAMBUDDY_URL"), "/"),
-		BambuddyAPIKey:           os.Getenv("BAMBUDDY_API_KEY"),
-		OpenAIAPIKey:             os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:            strings.TrimRight(envOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
-		OpenAIModel:              envOrDefault("OPENAI_MODEL", "gpt-5.6-sol"),
-		OpenAIImageDetail:        envOrDefault("OPENAI_IMAGE_DETAIL", "high"),
-		WebhookSecret:            os.Getenv("WEBHOOK_SECRET"),
-		SnapshotDelay:            5 * time.Second,
-		EmptyConfidenceThreshold: 0.95,
-		FirstLayerFailThreshold:  0.99,
-		EventMaxAge:              5 * time.Minute,
-		WorkerCount:              4,
-		ShutdownTimeout:          5 * time.Minute,
-		AutoEnablePlateClear:     true,
-		BambuddyTimeout:          15 * time.Second,
-		OpenAITimeout:            60 * time.Second,
+		ListenAddr:           envOrDefault("LISTEN_ADDR", "127.0.0.1:8787"),
+		BambuddyURL:          strings.TrimRight(os.Getenv("BAMBUDDY_URL"), "/"),
+		BambuddyAPIKey:       os.Getenv("BAMBUDDY_API_KEY"),
+		OpenAIAPIKey:         os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:        strings.TrimRight(envOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
+		OpenAIModel:          envOrDefault("OPENAI_MODEL", "gpt-5.6-sol"),
+		OpenAIImageDetail:    envOrDefault("OPENAI_IMAGE_DETAIL", "high"),
+		WebhookSecret:        os.Getenv("WEBHOOK_SECRET"),
+		SnapshotDelay:        5 * time.Second,
+		EventMaxAge:          5 * time.Minute,
+		WorkerCount:          4,
+		ShutdownTimeout:      5 * time.Minute,
+		AutoEnablePlateClear: true,
+		BambuddyTimeout:      15 * time.Second,
+		OpenAITimeout:        60 * time.Second,
 	}
 
 	var err error
@@ -72,12 +67,6 @@ func loadConfig() (config, error) {
 	if cfg.WorkerCount, err = envInt("WORKER_COUNT", cfg.WorkerCount); err != nil {
 		return config{}, err
 	}
-	if cfg.EmptyConfidenceThreshold, err = envFloat("EMPTY_CONFIDENCE_THRESHOLD", cfg.EmptyConfidenceThreshold); err != nil {
-		return config{}, err
-	}
-	if cfg.FirstLayerFailThreshold, err = envFloat("FIRST_LAYER_FAILURE_THRESHOLD", cfg.FirstLayerFailThreshold); err != nil {
-		return config{}, err
-	}
 	if cfg.AutoEnablePlateClear, err = envBool("AUTO_ENABLE_PLATE_CLEAR", cfg.AutoEnablePlateClear); err != nil {
 		return config{}, err
 	}
@@ -93,12 +82,6 @@ func loadConfig() (config, error) {
 	}
 	if cfg.WebhookSecret == "" {
 		return config{}, fmt.Errorf("WEBHOOK_SECRET is required")
-	}
-	if math.IsNaN(cfg.EmptyConfidenceThreshold) || math.IsInf(cfg.EmptyConfidenceThreshold, 0) || cfg.EmptyConfidenceThreshold < 0 || cfg.EmptyConfidenceThreshold > 1 {
-		return config{}, fmt.Errorf("EMPTY_CONFIDENCE_THRESHOLD must be between 0 and 1")
-	}
-	if math.IsNaN(cfg.FirstLayerFailThreshold) || math.IsInf(cfg.FirstLayerFailThreshold, 0) || cfg.FirstLayerFailThreshold < 0.99 || cfg.FirstLayerFailThreshold > 1 {
-		return config{}, fmt.Errorf("FIRST_LAYER_FAILURE_THRESHOLD must be between 0.99 and 1")
 	}
 	if cfg.SnapshotDelay < 0 {
 		return config{}, fmt.Errorf("SNAPSHOT_DELAY cannot be negative")
@@ -158,18 +141,6 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 	parsed, err := time.ParseDuration(value)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be a duration such as 5s: %w", key, err)
-	}
-	return parsed, nil
-}
-
-func envFloat(key string, fallback float64) (float64, error) {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback, nil
-	}
-	parsed, err := strconv.ParseFloat(value, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be a number: %w", key, err)
 	}
 	return parsed, nil
 }

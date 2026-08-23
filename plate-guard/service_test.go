@@ -124,13 +124,11 @@ func (f *fakeAssessor) assessFirstLayer(context.Context, []byte, string) (firstL
 
 func testConfig() config {
 	return config{
-		WebhookSecret:            "webhook-secret",
-		SnapshotDelay:            0,
-		EmptyConfidenceThreshold: 0.95,
-		FirstLayerFailThreshold:  0.99,
-		EventMaxAge:              5 * time.Minute,
-		BambuddyTimezone:         time.UTC,
-		WorkerCount:              1,
+		WebhookSecret:    "webhook-secret",
+		SnapshotDelay:    0,
+		EventMaxAge:      5 * time.Minute,
+		BambuddyTimezone: time.UTC,
+		WorkerCount:      1,
 	}
 }
 
@@ -256,7 +254,7 @@ func TestFailedAndStoppedWebhooksCanReleaseClearGate(t *testing.T) {
 	}
 }
 
-func TestFirstLayerWebhookPausesOnlyAfterTwoCertainFailures(t *testing.T) {
+func TestFirstLayerWebhookPausesOnlyAfterTwoDefectClassifications(t *testing.T) {
 	now := time.Now()
 	controller := &fakeController{
 		paused:     make(chan int, 1),
@@ -269,7 +267,7 @@ func TestFirstLayerWebhookPausesOnlyAfterTwoCertainFailures(t *testing.T) {
 	certainFailure := firstLayerAssessment{
 		FirstLayerVisible: true,
 		IsDefective:       true,
-		Confidence:        0.995,
+		Confidence:        0,
 		Reason:            "Loose extrusion is visibly detached and tangled.",
 	}
 	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{certainFailure, certainFailure}}
@@ -498,17 +496,17 @@ func TestFirstLayerDisconnectedPrinterDoesNotPause(t *testing.T) {
 	}
 }
 
-func TestCertainFirstLayerFailureRequiresEveryCondition(t *testing.T) {
+func TestFirstLayerFailureRequiresVisibleDefect(t *testing.T) {
 	svc := newService(testConfig(), &fakeController{}, &fakeAssessor{}, log.New(io.Discard, "", 0))
 	tests := []struct {
 		name       string
 		assessment firstLayerAssessment
 		want       bool
 	}{
-		{name: "certain failure", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 0.99}, want: true},
+		{name: "visible defect", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 0.99}, want: true},
 		{name: "not visible", assessment: firstLayerAssessment{FirstLayerVisible: false, IsDefective: true, Confidence: 1}},
 		{name: "not defective", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: false, Confidence: 1}},
-		{name: "below threshold", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 0.989}},
+		{name: "confidence ignored", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 0}, want: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -549,31 +547,37 @@ func TestWebhookRejectsStaleTimestamp(t *testing.T) {
 	}
 }
 
-func TestLowConfidenceLeavesPlateGated(t *testing.T) {
+func TestConfidenceDoesNotAffectPlateRelease(t *testing.T) {
 	now := time.Now()
+	gate := plateGateStatus{
+		ID:                 7,
+		Name:               "P1S",
+		AwaitingPlateClear: true,
+		State:              "FINISH",
+		SubtaskName:        "part.3mf",
+	}
+	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}
 	controller := &fakeController{
-		cleared: make(chan int, 1),
-		gateStatuses: []plateGateStatus{{
-			ID:                 7,
-			Name:               "P1S",
-			AwaitingPlateClear: true,
-			State:              "FINISH",
-			SubtaskName:        "part.3mf",
-		}},
-		terminalJobs: []terminalJob{{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}},
+		cleared:          make(chan int, 1),
+		gateStatuses:     []plateGateStatus{gate, gate},
+		terminalJobs:     []terminalJob{terminal, terminal},
+		plateClearActive: true,
 	}
 	assessor := &fakeAssessor{assessment: plateAssessment{
 		PlateVisible: true,
 		IsEmpty:      true,
-		Confidence:   0.80,
+		Confidence:   0,
 		Reason:       "possibly clear",
 	}}
 	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
 	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
 	select {
-	case <-controller.cleared:
-		t.Fatal("low-confidence assessment must not clear the gate")
-	default:
+	case printerID := <-controller.cleared:
+		if printerID != 7 {
+			t.Fatalf("unexpected printer ID: %d", printerID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("confidence should not prevent an otherwise safe release")
 	}
 }
 

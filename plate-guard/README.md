@@ -7,7 +7,7 @@ The queue-release path fails closed:
 - It verifies Bambuddy's global `require_plate_clear` setting before accepting webhooks and again before release.
 - It authenticates each webhook and binds it to the path printer, printer name, normalized print name, and latest terminal queue-job ID, status, and timestamp.
 - It analyzes two newly captured camera snapshots. The finish photo embedded in the webhook is not used as release evidence.
-- Both OpenAI assessments must find the normal fixed-camera view usable and show no retained part or obstruction at or above the confidence threshold. A full view of every plate edge is not required.
+- Both OpenAI assessments must find the normal fixed-camera view usable and show no retained part or obstruction. A full view of every plate edge is not required.
 - Camera, OpenAI, Bambuddy, timeout, stale-event, and uncertain-result failures do not send a clear request.
 - It maps completed, failed, and stopped webhooks to their exact terminal queue statuses, then rechecks the same queue job and printer gate immediately before calling Bambuddy's `clear-plate` endpoint.
 
@@ -16,7 +16,7 @@ The first-layer path is deliberately conservative against false pauses:
 - It accepts Bambuddy's `first_layer_complete` event only when the printer is connected and the named print is still `RUNNING` at layer 2 or later.
 - It binds the event to the exact active Bambuddy queue-item ID and start time. Non-queue/manual prints are not automatically paused.
 - It uses a separate high-precision failure-detection prompt on two fresh, byte-distinct snapshots.
-- Both assessments must show a visible, major physical defect at or above `FIRST_LAYER_FAILURE_THRESHOLD`.
+- Both assessments must classify a visible, major physical defect before Plate Guard can pause the print.
 - Unclear images, API failures, low confidence, and disagreement let the print continue.
 - It rechecks the connection, queue-item ID/start time, print identity, and non-reset layer counter immediately before requesting a pause.
 - It never stops, resumes, or starts a printer directly.
@@ -59,8 +59,6 @@ Configuration is read from environment variables.
 | `BAMBUDDY_TIMEZONE` | No | `UTC` | IANA timezone for Bambuddy's offset-free webhook timestamps |
 | `EVENT_MAX_AGE` | No | `5m` | Maximum webhook and queued-job age |
 | `SNAPSHOT_DELAY` | No | `5s` | Delay before the first fresh snapshot |
-| `EMPTY_CONFIDENCE_THRESHOLD` | No | `0.95` | Minimum confidence required from each assessment |
-| `FIRST_LAYER_FAILURE_THRESHOLD` | No | `0.99` | Minimum confidence from both defect assessments; values below `0.99` are rejected |
 | `WORKER_COUNT` | No | `4` | Concurrent workers; jobs for one printer remain serialized |
 | `AUTO_ENABLE_PLATE_CLEAR` | No | `true` | Attempt to enable `require_plate_clear` during startup |
 | `DRY_RUN` | No | `false` | Analyze and revalidate without sending pause or `clear-plate` requests |
@@ -88,6 +86,8 @@ go run .
 Set `BAMBUDDY_TIMEZONE` to the Bambuddy process or container's timezone when it is not UTC, for example `America/Los_Angeles`. This may differ from the Docker host's timezone. Bambuddy 1.2.5 emits offset-free webhook timestamps but stores queue completion timestamps in UTC; the correct setting is required to bind them safely.
 
 Each completion candidate makes up to two OpenAI vision calls. Each first-layer event makes one call when the first assessment is safe or uncertain and two calls when a possible failure needs confirmation. Account for these calls in API budgets and rate limits.
+
+OpenAI still returns a numeric confidence value for diagnostics and journaling, but Plate Guard deliberately ignores it for release and pause decisions. Only the structured visibility, empty, and defective booleans affect control actions.
 
 ## Bambuddy Setup
 

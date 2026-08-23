@@ -51,24 +51,22 @@ type plateJob struct {
 }
 
 type service struct {
-	controller          plateController
-	assessor            plateAssessor
-	logger              *log.Logger
-	webhookSecret       string
-	snapshotDelay       time.Duration
-	confidenceThreshold float64
-	firstLayerThreshold float64
-	eventMaxAge         time.Duration
-	timezone            *time.Location
-	workerCount         int
-	dryRun              bool
-	jobs                chan plateJob
-	jobSlots            chan struct{}
-	workerSlots         chan struct{}
-	queueMu             sync.RWMutex
-	accepting           bool
-	workerCancel        context.CancelFunc
-	workerWG            sync.WaitGroup
+	controller    plateController
+	assessor      plateAssessor
+	logger        *log.Logger
+	webhookSecret string
+	snapshotDelay time.Duration
+	eventMaxAge   time.Duration
+	timezone      *time.Location
+	workerCount   int
+	dryRun        bool
+	jobs          chan plateJob
+	jobSlots      chan struct{}
+	workerSlots   chan struct{}
+	queueMu       sync.RWMutex
+	accepting     bool
+	workerCancel  context.CancelFunc
+	workerWG      sync.WaitGroup
 }
 
 func newService(cfg config, controller plateController, assessor plateAssessor, logger *log.Logger) *service {
@@ -77,20 +75,18 @@ func newService(cfg config, controller plateController, assessor plateAssessor, 
 		workerCount = 1
 	}
 	return &service{
-		controller:          controller,
-		assessor:            assessor,
-		logger:              logger,
-		webhookSecret:       cfg.WebhookSecret,
-		snapshotDelay:       cfg.SnapshotDelay,
-		confidenceThreshold: cfg.EmptyConfidenceThreshold,
-		firstLayerThreshold: cfg.FirstLayerFailThreshold,
-		eventMaxAge:         cfg.EventMaxAge,
-		timezone:            cfg.BambuddyTimezone,
-		workerCount:         workerCount,
-		dryRun:              cfg.DryRun,
-		jobs:                make(chan plateJob, 256),
-		jobSlots:            make(chan struct{}, 256),
-		workerSlots:         make(chan struct{}, workerCount),
+		controller:    controller,
+		assessor:      assessor,
+		logger:        logger,
+		webhookSecret: cfg.WebhookSecret,
+		snapshotDelay: cfg.SnapshotDelay,
+		eventMaxAge:   cfg.EventMaxAge,
+		timezone:      cfg.BambuddyTimezone,
+		workerCount:   workerCount,
+		dryRun:        cfg.DryRun,
+		jobs:          make(chan plateJob, 256),
+		jobSlots:      make(chan struct{}, 256),
+		workerSlots:   make(chan struct{}, workerCount),
 	}
 }
 
@@ -491,11 +487,11 @@ func (s *service) freshSnapshot(ctx context.Context, printerID int, delay time.D
 }
 
 func (s *service) safeAssessment(assessment plateAssessment) bool {
-	return assessment.PlateVisible && assessment.IsEmpty && assessment.Confidence >= s.confidenceThreshold
+	return assessment.PlateVisible && assessment.IsEmpty
 }
 
 func (s *service) certainFirstLayerFailure(assessment firstLayerAssessment) bool {
-	return assessment.FirstLayerVisible && assessment.IsDefective && assessment.Confidence >= s.firstLayerThreshold
+	return assessment.FirstLayerVisible && assessment.IsDefective
 }
 
 func (s *service) logAssessment(printerID int, stage string, assessment plateAssessment) {
