@@ -21,6 +21,7 @@ type config struct {
 	WebhookSecret            string
 	SnapshotDelay            time.Duration
 	EmptyConfidenceThreshold float64
+	FirstLayerFailThreshold  float64
 	EventMaxAge              time.Duration
 	BambuddyTimezone         *time.Location
 	WorkerCount              int
@@ -43,6 +44,7 @@ func loadConfig() (config, error) {
 		WebhookSecret:            os.Getenv("WEBHOOK_SECRET"),
 		SnapshotDelay:            5 * time.Second,
 		EmptyConfidenceThreshold: 0.95,
+		FirstLayerFailThreshold:  0.99,
 		EventMaxAge:              5 * time.Minute,
 		WorkerCount:              4,
 		ShutdownTimeout:          5 * time.Minute,
@@ -73,6 +75,9 @@ func loadConfig() (config, error) {
 	if cfg.EmptyConfidenceThreshold, err = envFloat("EMPTY_CONFIDENCE_THRESHOLD", cfg.EmptyConfidenceThreshold); err != nil {
 		return config{}, err
 	}
+	if cfg.FirstLayerFailThreshold, err = envFloat("FIRST_LAYER_FAILURE_THRESHOLD", cfg.FirstLayerFailThreshold); err != nil {
+		return config{}, err
+	}
 	if cfg.AutoEnablePlateClear, err = envBool("AUTO_ENABLE_PLATE_CLEAR", cfg.AutoEnablePlateClear); err != nil {
 		return config{}, err
 	}
@@ -91,6 +96,9 @@ func loadConfig() (config, error) {
 	}
 	if math.IsNaN(cfg.EmptyConfidenceThreshold) || math.IsInf(cfg.EmptyConfidenceThreshold, 0) || cfg.EmptyConfidenceThreshold < 0 || cfg.EmptyConfidenceThreshold > 1 {
 		return config{}, fmt.Errorf("EMPTY_CONFIDENCE_THRESHOLD must be between 0 and 1")
+	}
+	if math.IsNaN(cfg.FirstLayerFailThreshold) || math.IsInf(cfg.FirstLayerFailThreshold, 0) || cfg.FirstLayerFailThreshold < 0.95 || cfg.FirstLayerFailThreshold > 1 {
+		return config{}, fmt.Errorf("FIRST_LAYER_FAILURE_THRESHOLD must be between 0.95 and 1")
 	}
 	if cfg.SnapshotDelay < 0 {
 		return config{}, fmt.Errorf("SNAPSHOT_DELAY cannot be negative")

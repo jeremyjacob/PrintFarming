@@ -16,19 +16,25 @@ import (
 type fakeController struct {
 	mu               sync.Mutex
 	cleared          chan int
+	paused           chan int
 	gateStatuses     []plateGateStatus
 	gateCalls        int
 	terminalJobs     []terminalJob
 	terminalCalls    int
 	plateClearActive bool
 	snapshotCalls    int
+	staticSnapshots  bool
 }
 
 func (f *fakeController) snapshot(context.Context, int) ([]byte, string, error) {
 	f.mu.Lock()
 	f.snapshotCalls++
+	call := f.snapshotCalls
+	if f.staticSnapshots {
+		call = 0
+	}
 	f.mu.Unlock()
-	return []byte{0xff, 0xd8, 0xff, 0xdb}, "image/jpeg", nil
+	return []byte{0xff, 0xd8, 0xff, 0xdb, byte(call)}, "image/jpeg", nil
 }
 
 func (f *fakeController) gateStatus(context.Context, int) (plateGateStatus, error) {
@@ -70,12 +76,34 @@ func (f *fakeController) clearPlate(_ context.Context, printerID int) error {
 	return nil
 }
 
+func (f *fakeController) pausePrint(_ context.Context, printerID int) error {
+	f.paused <- printerID
+	return nil
+}
+
 type fakeAssessor struct {
-	assessment plateAssessment
+	mu                    sync.Mutex
+	assessment            plateAssessment
+	firstLayerAssessments []firstLayerAssessment
+	firstLayerCalls       int
 }
 
 func (f *fakeAssessor) assess(context.Context, []byte, string) (plateAssessment, error) {
 	return f.assessment, nil
+}
+
+func (f *fakeAssessor) assessFirstLayer(context.Context, []byte, string) (firstLayerAssessment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.firstLayerAssessments) == 0 {
+		return firstLayerAssessment{}, nil
+	}
+	index := f.firstLayerCalls
+	if index >= len(f.firstLayerAssessments) {
+		index = len(f.firstLayerAssessments) - 1
+	}
+	f.firstLayerCalls++
+	return f.firstLayerAssessments[index], nil
 }
 
 func testConfig() config {
@@ -83,6 +111,7 @@ func testConfig() config {
 		WebhookSecret:            "webhook-secret",
 		SnapshotDelay:            0,
 		EmptyConfidenceThreshold: 0.95,
+		FirstLayerFailThreshold:  0.99,
 		EventMaxAge:              5 * time.Minute,
 		BambuddyTimezone:         time.UTC,
 		WorkerCount:              1,
@@ -92,6 +121,15 @@ func testConfig() config {
 func testEvent(now time.Time) webhookEvent {
 	return webhookEvent{
 		Event:     "print_complete",
+		Printer:   "P1S",
+		Filename:  "part.3mf",
+		Timestamp: now.Format(time.RFC3339Nano),
+	}
+}
+
+func firstLayerEvent(now time.Time) webhookEvent {
+	return webhookEvent{
+		Event:     "first_layer_complete",
 		Printer:   "P1S",
 		Filename:  "part.3mf",
 		Timestamp: now.Format(time.RFC3339Nano),
@@ -146,6 +184,209 @@ func TestWebhookClearsOnlyConfidentEmptyPlate(t *testing.T) {
 	defer controller.mu.Unlock()
 	if controller.snapshotCalls != 2 {
 		t.Fatalf("expected two fresh snapshots, got %d", controller.snapshotCalls)
+	}
+}
+
+func TestFirstLayerWebhookPausesOnlyAfterTwoCertainFailures(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused: make(chan int, 1),
+		gateStatuses: []plateGateStatus{
+			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 3},
+		},
+	}
+	certainFailure := firstLayerAssessment{
+		FirstLayerVisible: true,
+		IsDefective:       true,
+		Confidence:        0.995,
+		Reason:            "Loose extrusion is visibly detached and tangled.",
+	}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{certainFailure, certainFailure}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		svc.shutdown(ctx)
+	})
+
+	payload, err := json.Marshal(firstLayerEvent(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/bambuddy/7", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer webhook-secret")
+	recorder := httptest.NewRecorder()
+	svc.handler().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	select {
+	case printerID := <-controller.paused:
+		if printerID != 7 {
+			t.Fatalf("unexpected printer ID: %d", printerID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("certain first-layer failure was not paused")
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.snapshotCalls != 2 || controller.gateCalls != 2 {
+		t.Fatalf("expected two snapshots and two status checks, got snapshots=%d status=%d", controller.snapshotCalls, controller.gateCalls)
+	}
+}
+
+func TestFirstLayerAmbiguityDoesNotPause(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused: make(chan int, 1),
+		gateStatuses: []plateGateStatus{{
+			ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+		}},
+	}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{{
+		FirstLayerVisible: false,
+		IsDefective:       true,
+		Confidence:        0.999,
+		Reason:            "The deposited layer is obscured by glare.",
+	}}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("an unassessable first layer must not pause")
+	default:
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.snapshotCalls != 1 || controller.gateCalls != 1 {
+		t.Fatalf("ambiguous result should stop after one assessment, got snapshots=%d status=%d", controller.snapshotCalls, controller.gateCalls)
+	}
+}
+
+func TestFirstLayerFailureRequiresIndependentConfirmation(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused: make(chan int, 1),
+		gateStatuses: []plateGateStatus{{
+			ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+		}},
+	}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{
+		{FirstLayerVisible: true, IsDefective: true, Confidence: 0.999, Reason: "Possible detached filament."},
+		{FirstLayerVisible: true, IsDefective: false, Confidence: 0.999, Reason: "The extrusion appears bonded."},
+	}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("a disputed first-layer failure must not pause")
+	default:
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.snapshotCalls != 2 || controller.gateCalls != 1 {
+		t.Fatalf("expected two assessments without final action check, got snapshots=%d status=%d", controller.snapshotCalls, controller.gateCalls)
+	}
+}
+
+func TestFirstLayerFailureRequiresDistinctSnapshots(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused:          make(chan int, 1),
+		staticSnapshots: true,
+		gateStatuses: []plateGateStatus{{
+			ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+		}},
+	}
+	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{failure, failure}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("identical snapshots must not trigger a pause")
+	default:
+	}
+	assessor.mu.Lock()
+	defer assessor.mu.Unlock()
+	if assessor.firstLayerCalls != 1 {
+		t.Fatalf("identical confirmation image should not be reassessed, got %d model calls", assessor.firstLayerCalls)
+	}
+}
+
+func TestFirstLayerDryRunRevalidatesWithoutPausing(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused: make(chan int, 1),
+		gateStatuses: []plateGateStatus{
+			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 4},
+		},
+	}
+	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{failure, failure}}
+	cfg := testConfig()
+	cfg.DryRun = true
+	svc := newService(cfg, controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("dry run must not pause a print")
+	default:
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.snapshotCalls != 2 || controller.gateCalls != 2 {
+		t.Fatalf("dry run skipped first-layer checks: snapshots=%d status=%d", controller.snapshotCalls, controller.gateCalls)
+	}
+}
+
+func TestFirstLayerFailureDoesNotPauseAReplacementPrint(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused: make(chan int, 1),
+		gateStatuses: []plateGateStatus{
+			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", State: "RUNNING", CurrentPrint: "replacement.3mf", SubtaskName: "replacement.3mf", LayerNum: 2},
+		},
+	}
+	failure := firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 1, Reason: "Certain detached extrusion."}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{failure, failure}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("a replacement print must not be paused for an earlier event")
+	default:
+	}
+}
+
+func TestCertainFirstLayerFailureRequiresEveryCondition(t *testing.T) {
+	svc := newService(testConfig(), &fakeController{}, &fakeAssessor{}, log.New(io.Discard, "", 0))
+	tests := []struct {
+		name       string
+		assessment firstLayerAssessment
+		want       bool
+	}{
+		{name: "certain failure", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 0.99}, want: true},
+		{name: "not visible", assessment: firstLayerAssessment{FirstLayerVisible: false, IsDefective: true, Confidence: 1}},
+		{name: "not defective", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: false, Confidence: 1}},
+		{name: "below threshold", assessment: firstLayerAssessment{FirstLayerVisible: true, IsDefective: true, Confidence: 0.989}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := svc.certainFirstLayerFailure(test.assessment); got != test.want {
+				t.Fatalf("certainFirstLayerFailure()=%t want %t", got, test.want)
+			}
+		})
 	}
 }
 
@@ -400,6 +641,10 @@ func (c *schedulingController) clearPlate(context.Context, int) error {
 	return nil
 }
 
+func (c *schedulingController) pausePrint(context.Context, int) error {
+	return nil
+}
+
 type schedulingAssessor struct {
 	releasePrinterOne <-chan struct{}
 	printerTwoSeen    chan struct{}
@@ -414,6 +659,10 @@ func (a *schedulingAssessor) assess(_ context.Context, image []byte, _ string) (
 		a.once.Do(func() { close(a.printerTwoSeen) })
 	}
 	return plateAssessment{PlateVisible: true, IsEmpty: false, Confidence: 0.99, Reason: "test"}, nil
+}
+
+func (a *schedulingAssessor) assessFirstLayer(context.Context, []byte, string) (firstLayerAssessment, error) {
+	return firstLayerAssessment{}, nil
 }
 
 func TestSamePrinterBacklogDoesNotStarveOtherPrinters(t *testing.T) {

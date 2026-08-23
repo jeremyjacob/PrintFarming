@@ -14,6 +14,7 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	var mu sync.Mutex
 	requirePlateClear := false
 	clearCalled := false
+	pauseCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-API-Key") != "bambuddy-key" {
 			http.Error(w, "missing API key", http.StatusUnauthorized)
@@ -32,6 +33,11 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/printers/7/clear-plate":
 			mu.Lock()
 			clearCalled = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/printers/7/print/pause":
+			mu.Lock()
+			pauseCalled = true
 			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/printers/7/status":
@@ -103,10 +109,16 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	if err := client.clearPlate(context.Background(), 7); err != nil {
 		t.Fatal(err)
 	}
+	if err := client.pausePrint(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if !clearCalled {
 		t.Fatal("clear-plate endpoint was not called")
+	}
+	if !pauseCalled {
+		t.Fatal("pause endpoint was not called")
 	}
 }
 

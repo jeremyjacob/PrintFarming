@@ -33,8 +33,10 @@ type plateGateStatus struct {
 	Name               string `json:"name"`
 	AwaitingPlateClear bool   `json:"awaiting_plate_clear"`
 	State              string `json:"state"`
+	CurrentPrint       string `json:"current_print"`
 	SubtaskName        string `json:"subtask_name"`
 	GcodeFile          string `json:"gcode_file"`
+	LayerNum           int    `json:"layer_num"`
 }
 
 type terminalJob struct {
@@ -295,6 +297,23 @@ func (c *bambuddyClient) clearPlate(ctx context.Context, printerID int) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return responseError("clear Bambuddy plate gate", resp)
+	}
+	return nil
+}
+
+func (c *bambuddyClient) pausePrint(ctx context.Context, printerID int) error {
+	path := "/api/v1/printers/" + strconv.Itoa(printerID) + "/print/pause"
+	req, err := c.newRequest(ctx, http.MethodPost, path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("pause Bambuddy print: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return responseError("pause Bambuddy print", resp)
 	}
 	return nil
 }

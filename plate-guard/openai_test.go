@@ -93,3 +93,54 @@ func TestOpenAIAssessRequiresCompletedStatus(t *testing.T) {
 		t.Fatal("expected a response without completed status to fail")
 	}
 }
+
+func TestOpenAIAssessFirstLayerUsesSpecializedConservativePrompt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		encoded, _ := json.Marshal(payload)
+		requestJSON := string(encoded)
+		for _, required := range []string{
+			`"name":"first_layer_assessment"`,
+			`"is_defective"`,
+			`False alarms are costly`,
+			`do not know the intended model`,
+		} {
+			if !strings.Contains(requestJSON, required) {
+				t.Fatalf("first-layer request missing %q: %s", required, requestJSON)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "completed",
+			"output": []any{
+				map[string]any{
+					"type": "message",
+					"content": []any{
+						map[string]any{
+							"type": "output_text",
+							"text": `{"first_layer_visible":true,"is_defective":true,"confidence":0.995,"reason":"Detached extrusion is visibly tangled."}`,
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := &openAIClient{
+		apiKey:      "openai-key",
+		baseURL:     server.URL,
+		model:       "test-model",
+		imageDetail: "high",
+		httpClient:  server.Client(),
+	}
+	assessment, err := client.assessFirstLayer(context.Background(), []byte{0xff, 0xd8, 0xff, 0xdb}, "image/jpeg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !assessment.FirstLayerVisible || !assessment.IsDefective || assessment.Confidence != 0.995 {
+		t.Fatalf("unexpected first-layer assessment: %+v", assessment)
+	}
+}

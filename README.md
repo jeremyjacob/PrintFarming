@@ -4,7 +4,7 @@ Tools and experiments for a Bambu Lab print farm.
 
 ## Bambuddy Plate Guard
 
-[`plate-guard/`](plate-guard/) contains a fail-closed Go service that receives Bambuddy print-completion webhooks, checks two fresh build-plate images with `gpt-5.6-terra`, and releases the next queued print only after every check passes.
+[`plate-guard/`](plate-guard/) contains a Go service that receives Bambuddy lifecycle webhooks, checks first-layer quality and completed build plates with `gpt-5.6-terra`, pauses only confirmed first-layer failures, and releases the next queued print only after every clear-plate check passes.
 
 See [`plate-guard/README.md`](plate-guard/README.md) for configuration, Bambuddy setup, safe commissioning, and systemd installation instructions.
 

@@ -9,6 +9,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", "")
 	t.Setenv("OPENAI_MODEL", "")
 	t.Setenv("EMPTY_CONFIDENCE_THRESHOLD", "")
+	t.Setenv("FIRST_LAYER_FAILURE_THRESHOLD", "")
 	t.Setenv("AUTO_ENABLE_PLATE_CLEAR", "")
 
 	cfg, err := loadConfig()
@@ -23,6 +24,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.EmptyConfidenceThreshold != 0.95 {
 		t.Fatalf("unexpected confidence threshold: %f", cfg.EmptyConfidenceThreshold)
+	}
+	if cfg.FirstLayerFailThreshold != 0.99 {
+		t.Fatalf("unexpected first-layer failure threshold: %f", cfg.FirstLayerFailThreshold)
 	}
 	if cfg.OpenAIModel != "gpt-5.6-terra" {
 		t.Fatalf("unexpected OpenAI model: %q", cfg.OpenAIModel)
@@ -62,5 +66,16 @@ func TestLoadConfigRejectsExcessiveShutdownTimeout(t *testing.T) {
 
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("expected shutdown timeout above systemd limit to fail")
+	}
+}
+
+func TestLoadConfigRejectsUnsafeFirstLayerThreshold(t *testing.T) {
+	t.Setenv("BAMBUDDY_URL", "http://bambuddy:8000")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	t.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
+	t.Setenv("FIRST_LAYER_FAILURE_THRESHOLD", "0.94")
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("expected an unsafe first-layer threshold to fail")
 	}
 }

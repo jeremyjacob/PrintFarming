@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -27,10 +28,12 @@ type plateController interface {
 	latestTerminalJob(context.Context, int) (terminalJob, error)
 	plateClearEnabled(context.Context) (bool, error)
 	clearPlate(context.Context, int) error
+	pausePrint(context.Context, int) error
 }
 
 type plateAssessor interface {
 	assess(context.Context, []byte, string) (plateAssessment, error)
+	assessFirstLayer(context.Context, []byte, string) (firstLayerAssessment, error)
 }
 
 type webhookEvent struct {
@@ -53,6 +56,7 @@ type service struct {
 	webhookSecret       string
 	snapshotDelay       time.Duration
 	confidenceThreshold float64
+	firstLayerThreshold float64
 	eventMaxAge         time.Duration
 	timezone            *time.Location
 	workerCount         int
@@ -78,6 +82,7 @@ func newService(cfg config, controller plateController, assessor plateAssessor, 
 		webhookSecret:       cfg.WebhookSecret,
 		snapshotDelay:       cfg.SnapshotDelay,
 		confidenceThreshold: cfg.EmptyConfidenceThreshold,
+		firstLayerThreshold: cfg.FirstLayerFailThreshold,
 		eventMaxAge:         cfg.EventMaxAge,
 		timezone:            cfg.BambuddyTimezone,
 		workerCount:         workerCount,
@@ -146,7 +151,7 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if event.Event != "print_complete" {
+	if event.Event != "print_complete" && event.Event != "first_layer_complete" {
 		s.logger.Printf("ignored Bambuddy event=%q printer_id=%d", event.Event, printerID)
 		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 		return
@@ -158,7 +163,7 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	if eventTime.Before(now.Add(-s.eventMaxAge)) || eventTime.After(now.Add(time.Minute)) {
-		s.logger.Printf("rejected stale completion printer_id=%d timestamp=%q", printerID, event.Timestamp)
+		s.logger.Printf("rejected stale event=%q printer_id=%d timestamp=%q", event.Event, printerID, event.Timestamp)
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "stale webhook timestamp"})
 		return
 	}
@@ -172,17 +177,17 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	select {
 	case s.jobSlots <- struct{}{}:
 	default:
-		s.logger.Printf("job queue full; plate remains gated printer_id=%d", printerID)
+		s.logger.Printf("job queue full; event=%q took no action printer_id=%d", event.Event, printerID)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "job queue full"})
 		return
 	}
 	select {
 	case s.jobs <- plateJob{PrinterID: printerID, Event: event, EventTime: eventTime}:
-		s.logger.Printf("accepted print completion printer_id=%d printer=%q filename=%q", printerID, event.Printer, event.Filename)
+		s.logger.Printf("accepted Bambuddy event=%q printer_id=%d printer=%q filename=%q", event.Event, printerID, event.Printer, event.Filename)
 		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 	default:
 		<-s.jobSlots
-		s.logger.Printf("job queue full; plate remains gated printer_id=%d", printerID)
+		s.logger.Printf("job queue full; event=%q took no action printer_id=%d", event.Event, printerID)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "job queue full"})
 	}
 }
@@ -221,7 +226,7 @@ func (s *service) runPrinter(ctx context.Context, printerID int, jobs <-chan pla
 		func() {
 			defer func() { <-s.jobSlots }()
 			if ctx.Err() != nil {
-				s.logger.Printf("discarded queued completion during forced shutdown printer_id=%d", printerID)
+				s.logger.Printf("discarded queued event during forced shutdown printer_id=%d", printerID)
 				return
 			}
 			select {
@@ -229,7 +234,7 @@ func (s *service) runPrinter(ctx context.Context, printerID int, jobs <-chan pla
 				defer func() { <-s.workerSlots }()
 				s.processJob(ctx, job)
 			case <-ctx.Done():
-				s.logger.Printf("discarded queued completion during forced shutdown printer_id=%d", printerID)
+				s.logger.Printf("discarded queued event during forced shutdown printer_id=%d", printerID)
 			}
 		}()
 	}
@@ -266,6 +271,15 @@ func (s *service) shutdown(ctx context.Context) bool {
 }
 
 func (s *service) processJob(ctx context.Context, job plateJob) {
+	switch job.Event.Event {
+	case "print_complete":
+		s.processCompletion(ctx, job)
+	case "first_layer_complete":
+		s.processFirstLayer(ctx, job)
+	}
+}
+
+func (s *service) processCompletion(ctx context.Context, job plateJob) {
 	if time.Since(job.EventTime) > s.eventMaxAge {
 		s.logger.Printf("ignored stale queued completion printer_id=%d", job.PrinterID)
 		return
@@ -358,29 +372,116 @@ func (s *service) processJob(ctx context.Context, job plateJob) {
 	s.logger.Printf("plate gate cleared printer_id=%d; Bambuddy may dispatch the next queued print", job.PrinterID)
 }
 
-func (s *service) assessFreshSnapshot(ctx context.Context, printerID int, delay time.Duration) (plateAssessment, error) {
-	if delay > 0 {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return plateAssessment{}, ctx.Err()
-		case <-timer.C:
-		}
+func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
+	if time.Since(job.EventTime) > s.eventMaxAge {
+		s.logger.Printf("ignored stale first-layer event printer_id=%d", job.PrinterID)
+		return
 	}
-	image, contentType, err := s.controller.snapshot(ctx, printerID)
+	initialStatus, err := s.controller.gateStatus(ctx, job.PrinterID)
 	if err != nil {
-		return plateAssessment{}, err
+		s.logger.Printf("first-layer check skipped printer_id=%d: cannot verify active print: %v", job.PrinterID, err)
+		return
 	}
-	mediaType, err := validateImage(image, contentType)
+	if !activePrintMatchesEvent(initialStatus, job.PrinterID, job.Event) {
+		s.logger.Printf("first-layer check skipped printer_id=%d: webhook does not match an active print", job.PrinterID)
+		return
+	}
+
+	firstImage, firstMediaType, err := s.freshSnapshot(ctx, job.PrinterID, 0)
+	if err != nil {
+		s.logger.Printf("first-layer check inconclusive printer_id=%d: first snapshot failed: %v", job.PrinterID, err)
+		return
+	}
+	first, err := s.assessor.assessFirstLayer(ctx, firstImage, firstMediaType)
+	if err != nil {
+		s.logger.Printf("first-layer check inconclusive printer_id=%d: first assessment failed: %v", job.PrinterID, err)
+		return
+	}
+	s.logFirstLayerAssessment(job.PrinterID, "first", first)
+	if !s.certainFirstLayerFailure(first) {
+		s.logger.Printf("first-layer assessment did not justify a pause; print continues printer_id=%d", job.PrinterID)
+		return
+	}
+
+	secondImage, secondMediaType, err := s.freshSnapshot(ctx, job.PrinterID, 0)
+	if err != nil {
+		s.logger.Printf("first-layer check inconclusive printer_id=%d: confirmation snapshot failed: %v", job.PrinterID, err)
+		return
+	}
+	if bytes.Equal(firstImage, secondImage) {
+		s.logger.Printf("first-layer failure not confirmed printer_id=%d: camera returned identical snapshots", job.PrinterID)
+		return
+	}
+	second, err := s.assessor.assessFirstLayer(ctx, secondImage, secondMediaType)
+	if err != nil {
+		s.logger.Printf("first-layer check inconclusive printer_id=%d: confirmation assessment failed: %v", job.PrinterID, err)
+		return
+	}
+	s.logFirstLayerAssessment(job.PrinterID, "confirmation", second)
+	if !s.certainFirstLayerFailure(second) {
+		s.logger.Printf("first-layer failure was not confirmed; print continues printer_id=%d", job.PrinterID)
+		return
+	}
+	if time.Since(job.EventTime) > s.eventMaxAge {
+		s.logger.Printf("first-layer failure not actioned printer_id=%d: event expired during assessment", job.PrinterID)
+		return
+	}
+
+	currentStatus, err := s.controller.gateStatus(ctx, job.PrinterID)
+	if err != nil {
+		s.logger.Printf("first-layer failure not actioned printer_id=%d: cannot re-verify active print: %v", job.PrinterID, err)
+		return
+	}
+	if !sameActivePrint(initialStatus, currentStatus) {
+		s.logger.Printf("first-layer failure not actioned printer_id=%d: active print changed during assessment", job.PrinterID)
+		return
+	}
+	if s.dryRun {
+		s.logger.Printf("dry run: certain first-layer failure confirmed; would pause print printer_id=%d", job.PrinterID)
+		return
+	}
+	if err := s.controller.pausePrint(ctx, job.PrinterID); err != nil {
+		s.logger.Printf("pause outcome unknown printer_id=%d: request failed after possible delivery: %v", job.PrinterID, err)
+		return
+	}
+	s.logger.Printf("print pause requested after certain first-layer failure printer_id=%d", job.PrinterID)
+}
+
+func (s *service) assessFreshSnapshot(ctx context.Context, printerID int, delay time.Duration) (plateAssessment, error) {
+	image, mediaType, err := s.freshSnapshot(ctx, printerID, delay)
 	if err != nil {
 		return plateAssessment{}, err
 	}
 	return s.assessor.assess(ctx, image, mediaType)
 }
 
+func (s *service) freshSnapshot(ctx context.Context, printerID int, delay time.Duration) ([]byte, string, error) {
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+	image, contentType, err := s.controller.snapshot(ctx, printerID)
+	if err != nil {
+		return nil, "", err
+	}
+	mediaType, err := validateImage(image, contentType)
+	if err != nil {
+		return nil, "", err
+	}
+	return image, mediaType, nil
+}
+
 func (s *service) safeAssessment(assessment plateAssessment) bool {
 	return assessment.PlateVisible && assessment.IsEmpty && assessment.Confidence >= s.confidenceThreshold
+}
+
+func (s *service) certainFirstLayerFailure(assessment firstLayerAssessment) bool {
+	return assessment.FirstLayerVisible && assessment.IsDefective && assessment.Confidence >= s.firstLayerThreshold
 }
 
 func (s *service) logAssessment(printerID int, stage string, assessment plateAssessment) {
@@ -390,6 +491,18 @@ func (s *service) logAssessment(printerID int, stage string, assessment plateAss
 		stage,
 		assessment.PlateVisible,
 		assessment.IsEmpty,
+		assessment.Confidence,
+		assessment.Reason,
+	)
+}
+
+func (s *service) logFirstLayerAssessment(printerID int, stage string, assessment firstLayerAssessment) {
+	s.logger.Printf(
+		"first-layer assessment printer_id=%d stage=%s visible=%t defective=%t confidence=%.3f reason=%q",
+		printerID,
+		stage,
+		assessment.FirstLayerVisible,
+		assessment.IsDefective,
 		assessment.Confidence,
 		assessment.Reason,
 	)
@@ -414,6 +527,30 @@ func samePlateGate(before, after plateGateStatus) bool {
 		before.State == after.State &&
 		before.identity() != "" &&
 		before.identity() == after.identity()
+}
+
+func activePrintMatchesEvent(status plateGateStatus, printerID int, event webhookEvent) bool {
+	return status.ID == printerID &&
+		status.Name == event.Printer &&
+		status.State == "RUNNING" &&
+		status.LayerNum >= 2 &&
+		normalizePrintName(status.CurrentPrint) != "" &&
+		normalizePrintName(status.CurrentPrint) == normalizePrintName(event.Filename) &&
+		status.matchesEvent(event)
+}
+
+func sameActivePrint(before, after plateGateStatus) bool {
+	return before.ID > 0 &&
+		before.ID == after.ID &&
+		before.Name == after.Name &&
+		before.State == "RUNNING" &&
+		after.State == "RUNNING" &&
+		before.CurrentPrint != "" &&
+		before.CurrentPrint == after.CurrentPrint &&
+		before.identity() != "" &&
+		before.identity() == after.identity() &&
+		before.LayerNum >= 2 &&
+		after.LayerNum >= before.LayerNum
 }
 
 func sameTerminalJob(before, after terminalJob) bool {
