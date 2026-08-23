@@ -104,8 +104,8 @@ func loadConfig() (config, error) {
 	if cfg.EventMaxAge <= 0 {
 		return config{}, fmt.Errorf("EVENT_MAX_AGE must be greater than zero")
 	}
-	if cfg.ShutdownTimeout <= 0 {
-		return config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be greater than zero")
+	if cfg.ShutdownTimeout <= 0 || cfg.ShutdownTimeout > 5*time.Minute {
+		return config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be greater than zero and at most 5m")
 	}
 	if cfg.WorkerCount < 1 || cfg.WorkerCount > 32 {
 		return config{}, fmt.Errorf("WORKER_COUNT must be between 1 and 32")

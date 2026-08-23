@@ -55,6 +55,9 @@ jobs:
               -ldflags "-s -w -X main.version=$version" \
               -o "dist/$package/bambuddy-plate-guard" \
               .
+            cp README.md .env.example "dist/$package/"
+            mkdir -p "dist/$package/deploy/systemd"
+            cp deploy/systemd/bambuddy-plate-guard.service "dist/$package/deploy/systemd/"
             tar -C dist -czf "dist/$package.tar.gz" "$package"
             rm -rf "dist/$package"
           done

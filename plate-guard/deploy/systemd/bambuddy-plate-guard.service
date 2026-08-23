@@ -11,7 +11,7 @@ EnvironmentFile=/etc/bambuddy-plate-guard/bambuddy-plate-guard.env
 ExecStart=/usr/local/bin/bambuddy-plate-guard
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=315s
+TimeoutStopSec=330s
 UMask=0077
 
 NoNewPrivileges=yes

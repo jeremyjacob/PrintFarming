@@ -24,9 +24,8 @@ const (
 type plateController interface {
 	snapshot(context.Context, int) ([]byte, string, error)
 	gateStatus(context.Context, int) (plateGateStatus, error)
-	latestCompletion(context.Context, int) (completionRecord, error)
+	latestTerminalJob(context.Context, int) (terminalJob, error)
 	plateClearEnabled(context.Context) (bool, error)
-	checkPlate(context.Context, int, string) (localPlateAssessment, error)
 	clearPlate(context.Context, int) error
 }
 
@@ -59,15 +58,19 @@ type service struct {
 	workerCount         int
 	dryRun              bool
 	jobs                chan plateJob
+	jobSlots            chan struct{}
+	workerSlots         chan struct{}
 	queueMu             sync.RWMutex
 	accepting           bool
 	workerCancel        context.CancelFunc
 	workerWG            sync.WaitGroup
-	printerLocksMu      sync.Mutex
-	printerLocks        map[int]*sync.Mutex
 }
 
 func newService(cfg config, controller plateController, assessor plateAssessor, logger *log.Logger) *service {
+	workerCount := cfg.WorkerCount
+	if workerCount < 1 {
+		workerCount = 1
+	}
 	return &service{
 		controller:          controller,
 		assessor:            assessor,
@@ -77,10 +80,11 @@ func newService(cfg config, controller plateController, assessor plateAssessor, 
 		confidenceThreshold: cfg.EmptyConfidenceThreshold,
 		eventMaxAge:         cfg.EventMaxAge,
 		timezone:            cfg.BambuddyTimezone,
-		workerCount:         cfg.WorkerCount,
+		workerCount:         workerCount,
 		dryRun:              cfg.DryRun,
 		jobs:                make(chan plateJob, 256),
-		printerLocks:        make(map[int]*sync.Mutex),
+		jobSlots:            make(chan struct{}, 256),
+		workerSlots:         make(chan struct{}, workerCount),
 	}
 }
 
@@ -107,7 +111,7 @@ func (s *service) handleReady(w http.ResponseWriter, r *http.Request) {
 	s.queueMu.RLock()
 	accepting := s.accepting
 	s.queueMu.RUnlock()
-	if !accepting || len(s.jobs) == cap(s.jobs) {
+	if !accepting || len(s.jobSlots) == cap(s.jobSlots) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
 		return
 	}
@@ -166,10 +170,18 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	select {
+	case s.jobSlots <- struct{}{}:
+	default:
+		s.logger.Printf("job queue full; plate remains gated printer_id=%d", printerID)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "job queue full"})
+		return
+	}
+	select {
 	case s.jobs <- plateJob{PrinterID: printerID, Event: event, EventTime: eventTime}:
 		s.logger.Printf("accepted print completion printer_id=%d printer=%q filename=%q", printerID, event.Printer, event.Filename)
 		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 	default:
+		<-s.jobSlots
 		s.logger.Printf("job queue full; plate remains gated printer_id=%d", printerID)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "job queue full"})
 	}
@@ -181,15 +193,43 @@ func (s *service) start(parent context.Context) {
 	s.workerCancel = cancel
 	s.accepting = true
 	s.queueMu.Unlock()
-	for range s.workerCount {
-		s.workerWG.Add(1)
-		go func() {
-			defer s.workerWG.Done()
-			for job := range s.jobs {
-				lock := s.printerLock(job.PrinterID)
-				lock.Lock()
+	s.workerWG.Add(1)
+	go s.dispatch(ctx)
+}
+
+func (s *service) dispatch(ctx context.Context) {
+	defer s.workerWG.Done()
+	printerQueues := make(map[int]chan plateJob)
+	for job := range s.jobs {
+		queue := printerQueues[job.PrinterID]
+		if queue == nil {
+			queue = make(chan plateJob, cap(s.jobs))
+			printerQueues[job.PrinterID] = queue
+			s.workerWG.Add(1)
+			go s.runPrinter(ctx, job.PrinterID, queue)
+		}
+		queue <- job
+	}
+	for _, queue := range printerQueues {
+		close(queue)
+	}
+}
+
+func (s *service) runPrinter(ctx context.Context, printerID int, jobs <-chan plateJob) {
+	defer s.workerWG.Done()
+	for job := range jobs {
+		func() {
+			defer func() { <-s.jobSlots }()
+			if ctx.Err() != nil {
+				s.logger.Printf("discarded queued completion during forced shutdown printer_id=%d", printerID)
+				return
+			}
+			select {
+			case s.workerSlots <- struct{}{}:
+				defer func() { <-s.workerSlots }()
 				s.processJob(ctx, job)
-				lock.Unlock()
+			case <-ctx.Done():
+				s.logger.Printf("discarded queued completion during forced shutdown printer_id=%d", printerID)
 			}
 		}()
 	}
@@ -225,15 +265,6 @@ func (s *service) shutdown(ctx context.Context) bool {
 	}
 }
 
-func (s *service) printerLock(printerID int) *sync.Mutex {
-	s.printerLocksMu.Lock()
-	defer s.printerLocksMu.Unlock()
-	if s.printerLocks[printerID] == nil {
-		s.printerLocks[printerID] = &sync.Mutex{}
-	}
-	return s.printerLocks[printerID]
-}
-
 func (s *service) processJob(ctx context.Context, job plateJob) {
 	if time.Since(job.EventTime) > s.eventMaxAge {
 		s.logger.Printf("ignored stale queued completion printer_id=%d", job.PrinterID)
@@ -266,13 +297,13 @@ func (s *service) processJob(ctx context.Context, job plateJob) {
 		)
 		return
 	}
-	initialCompletion, err := s.controller.latestCompletion(ctx, job.PrinterID)
+	initialTerminal, err := s.controller.latestTerminalJob(ctx, job.PrinterID)
 	if err != nil {
-		s.logger.Printf("plate remains gated printer_id=%d: cannot identify completed queue item: %v", job.PrinterID, err)
+		s.logger.Printf("plate remains gated printer_id=%d: cannot identify terminal queue job: %v", job.PrinterID, err)
 		return
 	}
-	if !completionMatchesEvent(initialCompletion, job.EventTime, s.eventMaxAge) {
-		s.logger.Printf("plate remains gated printer_id=%d: webhook does not match latest queue completion", job.PrinterID)
+	if !terminalMatchesEvent(initialTerminal, job.EventTime, s.eventMaxAge) {
+		s.logger.Printf("plate remains gated printer_id=%d: webhook does not match latest successful queue completion", job.PrinterID)
 		return
 	}
 
@@ -297,13 +328,14 @@ func (s *service) processJob(ctx context.Context, job plateJob) {
 		s.logger.Printf("plate remains gated printer_id=%d", job.PrinterID)
 		return
 	}
-	if s.dryRun {
-		s.logger.Printf("dry run: would clear plate gate printer_id=%d", job.PrinterID)
-		return
-	}
 	plateClearEnabled, err := s.controller.plateClearEnabled(ctx)
 	if err != nil || !plateClearEnabled {
 		s.logger.Printf("plate remains gated printer_id=%d: require_plate_clear is not verified enabled: %v", job.PrinterID, err)
+		return
+	}
+	currentTerminal, err := s.controller.latestTerminalJob(ctx, job.PrinterID)
+	if err != nil || !sameTerminalJob(initialTerminal, currentTerminal) {
+		s.logger.Printf("plate remains gated printer_id=%d: terminal queue job changed during assessment", job.PrinterID)
 		return
 	}
 	currentGate, err := s.controller.gateStatus(ctx, job.PrinterID)
@@ -315,28 +347,8 @@ func (s *service) processJob(ctx context.Context, job plateJob) {
 		s.logger.Printf("plate remains gated printer_id=%d: plate gate changed during assessment", job.PrinterID)
 		return
 	}
-	currentCompletion, err := s.controller.latestCompletion(ctx, job.PrinterID)
-	if err != nil || currentCompletion.ID != initialCompletion.ID {
-		s.logger.Printf("plate remains gated printer_id=%d: completed queue item changed during assessment", job.PrinterID)
-		return
-	}
-	localAssessment, err := s.controller.checkPlate(ctx, job.PrinterID, initialCompletion.PlateType)
-	if err != nil {
-		s.logger.Printf("plate remains gated printer_id=%d: Bambuddy plate check failed: %v", job.PrinterID, err)
-		return
-	}
-	s.logger.Printf(
-		"Bambuddy plate assessment printer_id=%d empty=%t confidence=%.3f difference=%.3f needs_calibration=%t light_warning=%t message=%q",
-		job.PrinterID,
-		localAssessment.IsEmpty,
-		localAssessment.Confidence,
-		localAssessment.Difference,
-		localAssessment.NeedsCalibration,
-		localAssessment.LightWarning,
-		localAssessment.Message,
-	)
-	if !localAssessment.IsEmpty || localAssessment.NeedsCalibration || localAssessment.LightWarning {
-		s.logger.Printf("plate remains gated printer_id=%d: Bambuddy local plate check did not pass", job.PrinterID)
+	if s.dryRun {
+		s.logger.Printf("dry run: all checks passed; would clear plate gate printer_id=%d", job.PrinterID)
 		return
 	}
 	if err := s.controller.clearPlate(ctx, job.PrinterID); err != nil {
@@ -399,8 +411,17 @@ func samePlateGate(before, after plateGateStatus) bool {
 		after.AwaitingPlateClear &&
 		before.ID == after.ID &&
 		before.Name == after.Name &&
+		before.State == after.State &&
 		before.identity() != "" &&
 		before.identity() == after.identity()
+}
+
+func sameTerminalJob(before, after terminalJob) bool {
+	return before.ID > 0 &&
+		before.ID == after.ID &&
+		before.Status == after.Status &&
+		before.CompletedAt.Equal(after.CompletedAt) &&
+		before.PlateType == after.PlateType
 }
 
 func normalizePrintName(value string) string {
@@ -423,9 +444,9 @@ func normalizePrintName(value string) string {
 	return normalized.String()
 }
 
-func completionMatchesEvent(completion completionRecord, eventTime time.Time, maxAge time.Duration) bool {
-	delta := eventTime.Sub(completion.CompletedAt)
-	return completion.ID > 0 && delta >= 0 && delta <= maxAge
+func terminalMatchesEvent(job terminalJob, eventTime time.Time, maxAge time.Duration) bool {
+	delta := eventTime.Sub(job.CompletedAt)
+	return job.ID > 0 && job.Status == "completed" && delta >= 0 && delta <= maxAge
 }
 
 func (s *service) validAuthorization(header string) bool {

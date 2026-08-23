@@ -37,19 +37,11 @@ type plateGateStatus struct {
 	GcodeFile          string `json:"gcode_file"`
 }
 
-type completionRecord struct {
+type terminalJob struct {
 	ID          int
 	CompletedAt time.Time
 	PlateType   string
-}
-
-type localPlateAssessment struct {
-	IsEmpty          bool    `json:"is_empty"`
-	Confidence       float64 `json:"confidence"`
-	Difference       float64 `json:"difference_percent"`
-	Message          string  `json:"message"`
-	NeedsCalibration bool    `json:"needs_calibration"`
-	LightWarning     bool    `json:"light_warning"`
+	Status      string
 }
 
 func newBambuddyClient(rawURL, apiKey string, timezone *time.Location, httpClient *http.Client) (*bambuddyClient, error) {
@@ -225,24 +217,23 @@ func (c *bambuddyClient) gateStatus(ctx context.Context, printerID int) (plateGa
 	return status, nil
 }
 
-func (c *bambuddyClient) latestCompletion(ctx context.Context, printerID int) (completionRecord, error) {
+func (c *bambuddyClient) latestTerminalJob(ctx context.Context, printerID int) (terminalJob, error) {
 	u := c.endpoint("/api/v1/queue/")
 	query := u.Query()
 	query.Set("printer_id", strconv.Itoa(printerID))
-	query.Set("status", "completed")
 	u.RawQuery = query.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return completionRecord{}, err
+		return terminalJob{}, err
 	}
 	c.addAuthentication(req)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return completionRecord{}, fmt.Errorf("get latest Bambuddy queue completion: %w", err)
+		return terminalJob{}, fmt.Errorf("get latest Bambuddy terminal queue job: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return completionRecord{}, responseError("get latest Bambuddy queue completion", resp)
+		return terminalJob{}, responseError("get latest Bambuddy terminal queue job", resp)
 	}
 
 	var items []struct {
@@ -250,55 +241,45 @@ func (c *bambuddyClient) latestCompletion(ctx context.Context, printerID int) (c
 		PrinterID   int    `json:"printer_id"`
 		CompletedAt string `json:"completed_at"`
 		PlateType   string `json:"bed_type"`
+		Status      string `json:"status"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxQueueResponseBytes)).Decode(&items); err != nil {
-		return completionRecord{}, fmt.Errorf("decode Bambuddy queue completions: %w", err)
+		return terminalJob{}, fmt.Errorf("decode Bambuddy queue jobs: %w", err)
 	}
-	var latest completionRecord
+	var latest terminalJob
 	for _, item := range items {
-		if item.PrinterID != printerID || item.ID <= 0 || item.CompletedAt == "" {
+		if item.PrinterID != printerID || !isTerminalQueueStatus(item.Status) {
 			continue
+		}
+		if item.ID <= 0 || item.CompletedAt == "" {
+			return terminalJob{}, fmt.Errorf("Bambuddy returned an invalid terminal queue job for printer %d", printerID)
 		}
 		completedAt, err := parseBambuddyTime(item.CompletedAt, c.timezone)
 		if err != nil {
-			continue
+			return terminalJob{}, fmt.Errorf("parse terminal queue job %d timestamp: %w", item.ID, err)
 		}
 		if latest.ID == 0 || completedAt.After(latest.CompletedAt) {
-			latest = completionRecord{ID: item.ID, CompletedAt: completedAt, PlateType: item.PlateType}
+			latest = terminalJob{
+				ID:          item.ID,
+				CompletedAt: completedAt,
+				PlateType:   item.PlateType,
+				Status:      strings.ToLower(item.Status),
+			}
 		}
 	}
 	if latest.ID == 0 {
-		return completionRecord{}, fmt.Errorf("Bambuddy has no completed queue item for printer %d", printerID)
+		return terminalJob{}, fmt.Errorf("Bambuddy has no terminal queue job for printer %d", printerID)
 	}
 	return latest, nil
 }
 
-func (c *bambuddyClient) checkPlate(ctx context.Context, printerID int, plateType string) (localPlateAssessment, error) {
-	path := "/api/v1/printers/" + strconv.Itoa(printerID) + "/camera/check-plate"
-	u := c.endpoint(path)
-	if plateType != "" {
-		query := u.Query()
-		query.Set("plate_type", plateType)
-		u.RawQuery = query.Encode()
+func isTerminalQueueStatus(status string) bool {
+	switch strings.ToLower(status) {
+	case "completed", "failed", "cancelled", "aborted", "skipped":
+		return true
+	default:
+		return false
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return localPlateAssessment{}, err
-	}
-	c.addAuthentication(req)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return localPlateAssessment{}, fmt.Errorf("run Bambuddy plate check: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return localPlateAssessment{}, responseError("run Bambuddy plate check", resp)
-	}
-	var assessment localPlateAssessment
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBambuddyResponseBytes)).Decode(&assessment); err != nil {
-		return localPlateAssessment{}, fmt.Errorf("decode Bambuddy plate check: %w", err)
-	}
-	return assessment, nil
 }
 
 func (c *bambuddyClient) clearPlate(ctx context.Context, printerID int) error {

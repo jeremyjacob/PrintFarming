@@ -53,3 +53,14 @@ func TestLoadConfigRejectsZeroTimeout(t *testing.T) {
 		t.Fatal("expected zero OpenAI timeout to fail")
 	}
 }
+
+func TestLoadConfigRejectsExcessiveShutdownTimeout(t *testing.T) {
+	t.Setenv("BAMBUDDY_URL", "http://bambuddy:8000")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	t.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
+	t.Setenv("SHUTDOWN_TIMEOUT", "6m")
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("expected shutdown timeout above systemd limit to fail")
+	}
+}

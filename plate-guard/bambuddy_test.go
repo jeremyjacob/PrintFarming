@@ -52,24 +52,15 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 			w.Header().Set("Content-Type", "image/jpeg")
 			_, _ = w.Write([]byte{0xff, 0xd8, 0xff, 0xdb})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/queue/":
-			if r.URL.Query().Get("printer_id") != "7" || r.URL.Query().Get("status") != "completed" {
+			if r.URL.Query().Get("printer_id") != "7" || r.URL.Query().Has("status") {
 				http.Error(w, "missing queue filters", http.StatusBadRequest)
 				return
 			}
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"id": 40, "printer_id": 7, "completed_at": "2026-08-22T10:00:00Z"},
-				{"id": 42, "printer_id": 7, "completed_at": "2026-08-22T12:00:00Z", "bed_type": "Textured PEI Plate"},
-			})
-		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/printers/7/camera/check-plate":
-			if r.URL.Query().Get("plate_type") != "Textured PEI Plate" {
-				http.Error(w, "missing plate type", http.StatusBadRequest)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(localPlateAssessment{
-				IsEmpty:    true,
-				Confidence: 0.99,
-				Difference: 0.1,
-				Message:    "Plate appears empty",
+				{"id": 40, "printer_id": 7, "status": "completed", "completed_at": "2026-08-22T10:00:00Z"},
+				{"id": 42, "printer_id": 7, "status": "completed", "completed_at": "2026-08-22T12:00:00Z", "bed_type": "Textured PEI Plate"},
+				{"id": 43, "printer_id": 7, "status": "failed", "completed_at": "2026-08-22T13:00:00Z", "bed_type": "Textured PEI Plate"},
+				{"id": 44, "printer_id": 7, "status": "pending", "completed_at": nil},
 			})
 		default:
 			http.NotFound(w, r)
@@ -95,12 +86,12 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	if !status.AwaitingPlateClear || status.SubtaskName != "part" {
 		t.Fatalf("unexpected gate status: %+v", status)
 	}
-	completion, err := client.latestCompletion(context.Background(), 7)
+	terminal, err := client.latestTerminalJob(context.Background(), 7)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completion.ID != 42 || completion.PlateType != "Textured PEI Plate" || !completion.CompletedAt.Equal(time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)) {
-		t.Fatalf("unexpected completion: %+v", completion)
+	if terminal.ID != 43 || terminal.Status != "failed" || !terminal.CompletedAt.Equal(time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)) {
+		t.Fatalf("unexpected terminal job: %+v", terminal)
 	}
 	image, mediaType, err := client.snapshot(context.Background(), 7)
 	if err != nil {
@@ -108,13 +99,6 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	}
 	if len(image) == 0 || mediaType != "image/jpeg" {
 		t.Fatalf("unexpected snapshot: bytes=%d media_type=%q", len(image), mediaType)
-	}
-	localAssessment, err := client.checkPlate(context.Background(), 7, completion.PlateType)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !localAssessment.IsEmpty || localAssessment.NeedsCalibration || localAssessment.LightWarning {
-		t.Fatalf("unexpected local assessment: %+v", localAssessment)
 	}
 	if err := client.clearPlate(context.Background(), 7); err != nil {
 		t.Fatal(err)

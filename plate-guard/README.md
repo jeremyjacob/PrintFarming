@@ -5,21 +5,19 @@
 The service fails closed:
 
 - It verifies Bambuddy's global `require_plate_clear` setting before accepting webhooks and again before release.
-- It authenticates each webhook and binds it to the path printer, printer name, normalized print name, latest completed queue-item ID, and completion timestamp.
+- It authenticates each webhook and binds it to the path printer, printer name, normalized print name, and latest terminal queue-job ID, status, and timestamp.
 - It analyzes two newly captured camera snapshots. The finish photo embedded in the webhook is not used as release evidence.
 - Both OpenAI assessments must show a visible, empty plate at or above the confidence threshold.
-- Bambuddy's calibrated reference-image check must then pass with no calibration or chamber-light warning.
 - Camera, OpenAI, Bambuddy, timeout, stale-event, and uncertain-result failures do not send a clear request.
-- It rechecks the same printer gate and completed queue item immediately before calling Bambuddy's `clear-plate` endpoint.
+- It queries completed, failed, cancelled, aborted, and skipped queue jobs, then rechecks the same successful terminal job and printer gate immediately before calling Bambuddy's `clear-plate` endpoint.
 - It never pauses, stops, resumes, or starts a printer directly.
 
-Bambuddy 1.2.5 does not provide an atomic "clear this exact gate generation" operation. A manual action can theoretically change the gate between the final status check and `POST /clear-plate`.
+Bambuddy 1.2.5 does not provide an atomic "clear this exact gate generation" operation. A manual action can theoretically change the gate between the final status check and `POST /clear-plate`. Do not manually clear a gate while Plate Guard is processing its completion webhook. Once Plate Guard logs that it has held a gate, manual clearing is safe.
 
 ## Requirements
 
 - Bambuddy 1.2.5 or newer
 - A usable Bambuddy camera snapshot endpoint
-- Bambuddy plate detection enabled and calibrated for every managed printer and plate type, with the chamber light on
 - An OpenAI API key with Responses API access to `gpt-5.6-terra`
 - Go 1.22 or newer when building from source
 
@@ -58,7 +56,7 @@ Configuration is read from environment variables.
 | `DRY_RUN` | No | `false` | Analyze and log without sending `clear-plate` |
 | `BAMBUDDY_TIMEOUT` | No | `15s` | Timeout for each Bambuddy request |
 | `OPENAI_TIMEOUT` | No | `60s` | Timeout for each OpenAI request |
-| `SHUTDOWN_TIMEOUT` | No | `5m` | Maximum time to drain accepted webhook jobs |
+| `SHUTDOWN_TIMEOUT` | No | `5m` | Maximum drain time; values above `5m` are rejected to match the unit |
 
 Generate a dedicated webhook secret:
 
@@ -77,9 +75,9 @@ set +a
 go run .
 ```
 
-Set `BAMBUDDY_TIMEZONE` to the Bambuddy host's timezone when it is not UTC, for example `America/Los_Angeles`. Bambuddy 1.2.5 emits offset-free webhook timestamps but stores queue completion timestamps in UTC; the correct setting is required to bind them safely.
+Set `BAMBUDDY_TIMEZONE` to the Bambuddy process or container's timezone when it is not UTC, for example `America/Los_Angeles`. This may differ from the Docker host's timezone. Bambuddy 1.2.5 emits offset-free webhook timestamps but stores queue completion timestamps in UTC; the correct setting is required to bind them safely.
 
-Each candidate release makes two OpenAI vision calls followed by Bambuddy's local calibrated-image check. Account for the OpenAI calls in API budgets and rate limits.
+Each candidate release makes two OpenAI vision calls. Account for both calls in API budgets and rate limits.
 
 ## Bambuddy Setup
 
@@ -106,7 +104,7 @@ If Bambuddy authentication is enabled, create a dedicated key with:
 - Control printer: enabled
 - Queue, library, inventory, maintenance, archives, projects, and cloud management: disabled
 
-Read status permits the status, queue-read, settings-read, camera-view, local plate-check, and temporary camera-token calls used by the service. Control printer is required because Bambuddy maps `printers:clear_plate` to that scope. The service requests a fresh 60-minute camera token automatically; no camera token belongs in the environment file.
+Read status permits the status, queue-read, settings-read, camera-view, and temporary camera-token calls used by the service. Control printer is required because Bambuddy maps `printers:clear_plate` to that scope. The service requests a fresh 60-minute camera token automatically; no camera token belongs in the environment file.
 
 Bambuddy 1.2.5 does not consistently enforce an API key's printer allowlist on these routes. Treat the API key as able to read and clear all printers until that is fixed upstream, keep the webhook secret private, and firewall the listener to Bambuddy's network.
 
@@ -130,6 +128,8 @@ Bambuddy converts a plain Authorization value to `Bearer VALUE`; that is the for
 
 Finish-photo capture is not required. Bambuddy may include a base64 finish image, but Plate Guard intentionally ignores it and captures fresh snapshots after the configured delay.
 
+Plate Guard does not call Bambuddy's built-in plate detector and does not require its calibration references. Bambuddy plate detection can be disabled when Plate Guard is intended to replace it.
+
 The webhook URL is resolved from inside Bambuddy's process or container. If Bambuddy runs in Docker and Plate Guard runs on the host, use the host's LAN address, Docker bridge gateway, or a configured `host.docker.internal` mapping. Set `LISTEN_ADDR=0.0.0.0:8787` and firewall the port to the Bambuddy host or container network.
 
 ## Systemd Installation
@@ -145,7 +145,7 @@ sudo install -o root -g root -m 0600 .env.example /etc/bambuddy-plate-guard/bamb
 sudo install -o root -g root -m 0644 deploy/systemd/bambuddy-plate-guard.service /etc/systemd/system/bambuddy-plate-guard.service
 ```
 
-Alternatively, download the matching `linux_amd64` or `linux_arm64` archive from GitHub Releases, verify it against `checksums.txt`, extract it, and install the binary with mode `0755`.
+Alternatively, download the matching `linux_amd64` or `linux_arm64` archive from GitHub Releases and verify it against `checksums.txt`. Each archive contains the binary, `.env.example`, this README, and the systemd unit, so the same installation commands can be run from the extracted directory.
 
 To cross-compile manually from macOS or another non-Linux host, replace `ARCH` with `amd64` or `arm64`:
 
@@ -176,15 +176,14 @@ The unit uses a dynamic unprivileged user, a read-only filesystem, no Linux capa
 
 ## Safe Commissioning
 
-1. Empty the plate physically and calibrate Bambuddy plate detection for every plate type the printer will use.
-2. Set `DRY_RUN=true`.
-3. Start the service and send Bambuddy's webhook provider test.
-4. If the gate was enabled after a print had already finished, clear that pre-existing gate manually; it has no webhook for the daemon to process.
-5. Complete an ejection test print and inspect both OpenAI classifications and Bambuddy's local classification in the journal.
-6. Confirm the plate-clear gate remains active in Bambuddy.
-7. Manually clear the gate.
-8. Set `DRY_RUN=false` and restart the service.
-9. Test successful ejection, an occupied plate, an obscured camera, a chamber-light warning, and a deliberately failed OpenAI request before loading a production queue.
+1. Set `DRY_RUN=true`.
+2. Start the service and send Bambuddy's webhook provider test.
+3. If the gate was enabled after a print had already finished, clear that pre-existing gate manually; it has no webhook for the daemon to process.
+4. Complete an ejection test print and inspect both OpenAI classifications and the final gate/job revalidation in the journal.
+5. Confirm the plate-clear gate remains active in Bambuddy.
+6. Manually clear the gate.
+7. Set `DRY_RUN=false` and restart the service.
+8. Test successful ejection, an occupied plate, an obscured or dark camera, and a deliberately failed OpenAI request before loading a production queue.
 
 ```bash
 sudo systemctl restart bambuddy-plate-guard
@@ -200,15 +199,15 @@ If a `clear-plate` request times out after delivery, the result is inherently un
 - `GET /readyz`: accepting-work, queue-capacity, Bambuddy-connectivity, and gate-setting check
 - `POST /webhooks/bambuddy/{printer_id}`: authenticated Bambuddy notification receiver
 
-The webhook handler acknowledges quickly and performs analysis in a 256-entry bounded background queue. Four workers run by default, while a per-printer lock serializes jobs for the same printer. During shutdown, new work is rejected and accepted work drains for up to `SHUTDOWN_TIMEOUT`.
+The webhook handler acknowledges quickly and performs analysis in a 256-entry bounded background queue. Each printer has an ordered serial queue, while `WORKER_COUNT` limits concurrent processing across different printers. A backlog for one printer does not occupy the other printer workers. During shutdown, new work is rejected and accepted work drains for up to `SHUTDOWN_TIMEOUT`.
 
 ## Releases
 
-Pushing a tag matching `v*`, such as `v0.1.0`, runs `.github/workflows/release.yml`. The workflow tests and vets the module, then publishes executable archives for:
+Pushing a tag matching `v*`, such as `v0.1.1`, runs `.github/workflows/release.yml`. The workflow tests and vets the module, then publishes executable archives for:
 
 - Linux amd64
 - Linux arm64
 - macOS amd64
 - macOS arm64
 
-Every release includes `checksums.txt` with SHA-256 hashes.
+Every archive includes the binary, environment template, systemd unit, and Plate Guard README. Every release includes `checksums.txt` with SHA-256 hashes.

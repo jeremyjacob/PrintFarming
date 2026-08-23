@@ -18,11 +18,10 @@ type fakeController struct {
 	cleared          chan int
 	gateStatuses     []plateGateStatus
 	gateCalls        int
-	completions      []completionRecord
-	completionCalls  int
+	terminalJobs     []terminalJob
+	terminalCalls    int
 	plateClearActive bool
 	snapshotCalls    int
-	localAssessment  localPlateAssessment
 }
 
 func (f *fakeController) snapshot(context.Context, int) ([]byte, string, error) {
@@ -46,30 +45,24 @@ func (f *fakeController) gateStatus(context.Context, int) (plateGateStatus, erro
 	return f.gateStatuses[index], nil
 }
 
-func (f *fakeController) latestCompletion(context.Context, int) (completionRecord, error) {
+func (f *fakeController) latestTerminalJob(context.Context, int) (terminalJob, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.completions) == 0 {
-		return completionRecord{}, nil
+	if len(f.terminalJobs) == 0 {
+		return terminalJob{}, nil
 	}
-	index := f.completionCalls
-	if index >= len(f.completions) {
-		index = len(f.completions) - 1
+	index := f.terminalCalls
+	if index >= len(f.terminalJobs) {
+		index = len(f.terminalJobs) - 1
 	}
-	f.completionCalls++
-	return f.completions[index], nil
+	f.terminalCalls++
+	return f.terminalJobs[index], nil
 }
 
 func (f *fakeController) plateClearEnabled(context.Context) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.plateClearActive, nil
-}
-
-func (f *fakeController) checkPlate(context.Context, int, string) (localPlateAssessment, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.localAssessment, nil
 }
 
 func (f *fakeController) clearPlate(_ context.Context, printerID int) error {
@@ -108,13 +101,12 @@ func testEvent(now time.Time) webhookEvent {
 func TestWebhookClearsOnlyConfidentEmptyPlate(t *testing.T) {
 	now := time.Now()
 	gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"}
-	completion := completionRecord{ID: 42, CompletedAt: now.Add(-time.Second)}
+	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}
 	controller := &fakeController{
 		cleared:          make(chan int, 1),
 		gateStatuses:     []plateGateStatus{gate, gate},
-		completions:      []completionRecord{completion, completion},
+		terminalJobs:     []terminalJob{terminal, terminal},
 		plateClearActive: true,
-		localAssessment:  localPlateAssessment{IsEmpty: true, Confidence: 0.99, Message: "clear"},
 	}
 	assessor := &fakeAssessor{assessment: plateAssessment{
 		PlateVisible: true,
@@ -198,7 +190,7 @@ func TestLowConfidenceLeavesPlateGated(t *testing.T) {
 			State:              "FINISH",
 			SubtaskName:        "part.3mf",
 		}},
-		completions: []completionRecord{{ID: 42, CompletedAt: now.Add(-time.Second)}},
+		terminalJobs: []terminalJob{{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}},
 	}
 	assessor := &fakeAssessor{assessment: plateAssessment{
 		PlateVisible: true,
@@ -221,11 +213,10 @@ func TestChangedGateIsNotCleared(t *testing.T) {
 		cleared: make(chan int, 1),
 		gateStatuses: []plateGateStatus{
 			{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"},
-			{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "next-part.3mf"},
+			{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FAILED", SubtaskName: "part.3mf"},
 		},
-		completions:      []completionRecord{{ID: 42, CompletedAt: now.Add(-time.Second)}},
+		terminalJobs:     []terminalJob{{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}},
 		plateClearActive: true,
-		localAssessment:  localPlateAssessment{IsEmpty: true, Confidence: 0.99, Message: "clear"},
 	}
 	assessor := &fakeAssessor{assessment: plateAssessment{
 		PlateVisible: true,
@@ -239,6 +230,44 @@ func TestChangedGateIsNotCleared(t *testing.T) {
 	case <-controller.cleared:
 		t.Fatal("a changed plate gate must not be cleared")
 	default:
+	}
+}
+
+func TestDryRunExecutesAllSafetyChecks(t *testing.T) {
+	now := time.Now()
+	gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"}
+	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}
+	controller := &fakeController{
+		cleared:          make(chan int, 1),
+		gateStatuses:     []plateGateStatus{gate, gate},
+		terminalJobs:     []terminalJob{terminal, terminal},
+		plateClearActive: true,
+	}
+	assessor := &fakeAssessor{assessment: plateAssessment{
+		PlateVisible: true,
+		IsEmpty:      true,
+		Confidence:   0.99,
+		Reason:       "clear",
+	}}
+	cfg := testConfig()
+	cfg.DryRun = true
+	svc := newService(cfg, controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
+
+	select {
+	case <-controller.cleared:
+		t.Fatal("dry run must not clear the gate")
+	default:
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.snapshotCalls != 2 || controller.gateCalls != 2 || controller.terminalCalls != 2 {
+		t.Fatalf(
+			"dry run skipped checks: snapshots=%d gates=%d terminal_jobs=%d",
+			controller.snapshotCalls,
+			controller.gateCalls,
+			controller.terminalCalls,
+		)
 	}
 }
 
@@ -259,20 +288,17 @@ func TestPrinterMismatchIsNotCleared(t *testing.T) {
 	}
 }
 
-func TestBambuddyLocalCheckCanVetoRelease(t *testing.T) {
+func TestNewerFailedJobIsNotCleared(t *testing.T) {
 	now := time.Now()
 	gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"}
-	completion := completionRecord{ID: 42, CompletedAt: now.Add(-time.Second), PlateType: "Textured PEI Plate"}
 	controller := &fakeController{
-		cleared:          make(chan int, 1),
-		gateStatuses:     []plateGateStatus{gate, gate},
-		completions:      []completionRecord{completion, completion},
-		plateClearActive: true,
-		localAssessment: localPlateAssessment{
-			IsEmpty:    false,
-			Confidence: 0.99,
-			Message:    "Objects detected",
+		cleared:      make(chan int, 1),
+		gateStatuses: []plateGateStatus{gate, gate},
+		terminalJobs: []terminalJob{
+			{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)},
+			{ID: 43, Status: "failed", CompletedAt: now.Add(time.Second)},
 		},
+		plateClearActive: true,
 	}
 	assessor := &fakeAssessor{assessment: plateAssessment{
 		PlateVisible: true,
@@ -284,7 +310,7 @@ func TestBambuddyLocalCheckCanVetoRelease(t *testing.T) {
 	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
 	select {
 	case <-controller.cleared:
-		t.Fatal("Bambuddy's occupied result must veto the OpenAI assessments")
+		t.Fatal("a newer failed terminal job must not be cleared")
 	default:
 	}
 }
@@ -329,13 +355,100 @@ func TestGateMatchesBambuddyNormalizedFilename(t *testing.T) {
 	}
 }
 
-func TestCompletionMustMatchWebhookTimestamp(t *testing.T) {
+func TestTerminalJobMustMatchWebhookTimestampAndStatus(t *testing.T) {
 	now := time.Now()
-	completion := completionRecord{ID: 42, CompletedAt: now}
-	if completionMatchesEvent(completion, now.Add(-time.Minute), 5*time.Minute) {
+	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now}
+	if terminalMatchesEvent(terminal, now.Add(-time.Minute), 5*time.Minute) {
 		t.Fatal("a webhook older than the queue completion must not match")
 	}
-	if !completionMatchesEvent(completion, now.Add(time.Second), 5*time.Minute) {
+	if !terminalMatchesEvent(terminal, now.Add(time.Second), 5*time.Minute) {
 		t.Fatal("a webhook emitted after the queue completion should match")
 	}
+	terminal.Status = "failed"
+	if terminalMatchesEvent(terminal, now.Add(time.Second), 5*time.Minute) {
+		t.Fatal("a failed terminal job must not match a completion webhook")
+	}
+}
+
+type schedulingController struct {
+	now time.Time
+}
+
+func (c *schedulingController) snapshot(_ context.Context, printerID int) ([]byte, string, error) {
+	return []byte{0xff, 0xd8, 0xff, 0xdb, byte(printerID)}, "image/jpeg", nil
+}
+
+func (c *schedulingController) gateStatus(_ context.Context, printerID int) (plateGateStatus, error) {
+	return plateGateStatus{
+		ID:                 printerID,
+		Name:               "P1S",
+		AwaitingPlateClear: true,
+		State:              "FINISH",
+		SubtaskName:        "part.3mf",
+	}, nil
+}
+
+func (c *schedulingController) latestTerminalJob(_ context.Context, printerID int) (terminalJob, error) {
+	return terminalJob{ID: printerID, Status: "completed", CompletedAt: c.now.Add(-time.Second)}, nil
+}
+
+func (c *schedulingController) plateClearEnabled(context.Context) (bool, error) {
+	return true, nil
+}
+
+func (c *schedulingController) clearPlate(context.Context, int) error {
+	return nil
+}
+
+type schedulingAssessor struct {
+	releasePrinterOne <-chan struct{}
+	printerTwoSeen    chan struct{}
+	once              sync.Once
+}
+
+func (a *schedulingAssessor) assess(_ context.Context, image []byte, _ string) (plateAssessment, error) {
+	printerID := int(image[len(image)-1])
+	if printerID == 1 {
+		<-a.releasePrinterOne
+	} else if printerID == 2 {
+		a.once.Do(func() { close(a.printerTwoSeen) })
+	}
+	return plateAssessment{PlateVisible: true, IsEmpty: false, Confidence: 0.99, Reason: "test"}, nil
+}
+
+func TestSamePrinterBacklogDoesNotStarveOtherPrinters(t *testing.T) {
+	now := time.Now()
+	releasePrinterOne := make(chan struct{})
+	assessor := &schedulingAssessor{
+		releasePrinterOne: releasePrinterOne,
+		printerTwoSeen:    make(chan struct{}),
+	}
+	cfg := testConfig()
+	cfg.WorkerCount = 2
+	svc := newService(cfg, &schedulingController{now: now}, assessor, log.New(io.Discard, "", 0))
+	svc.start(context.Background())
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if !svc.shutdown(ctx) {
+			t.Error("service did not drain after concurrency test")
+		}
+	}()
+
+	enqueue := func(printerID int) {
+		svc.jobSlots <- struct{}{}
+		svc.jobs <- plateJob{PrinterID: printerID, Event: testEvent(now), EventTime: now}
+	}
+	enqueue(1)
+	enqueue(1)
+	enqueue(1)
+	enqueue(2)
+
+	select {
+	case <-assessor.printerTwoSeen:
+	case <-time.After(time.Second):
+		close(releasePrinterOne)
+		t.Fatal("printer 1 backlog starved printer 2")
+	}
+	close(releasePrinterOne)
 }
