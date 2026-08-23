@@ -28,7 +28,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.FirstLayerFailThreshold != 0.99 {
 		t.Fatalf("unexpected first-layer failure threshold: %f", cfg.FirstLayerFailThreshold)
 	}
-	if cfg.OpenAIModel != "gpt-5.6-terra" {
+	if cfg.OpenAIModel != "gpt-5.6-sol" {
 		t.Fatalf("unexpected OpenAI model: %q", cfg.OpenAIModel)
 	}
 	if !cfg.AutoEnablePlateClear {

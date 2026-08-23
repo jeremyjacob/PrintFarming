@@ -39,7 +39,7 @@ func loadConfig() (config, error) {
 		BambuddyAPIKey:           os.Getenv("BAMBUDDY_API_KEY"),
 		OpenAIAPIKey:             os.Getenv("OPENAI_API_KEY"),
 		OpenAIBaseURL:            strings.TrimRight(envOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
-		OpenAIModel:              envOrDefault("OPENAI_MODEL", "gpt-5.6-terra"),
+		OpenAIModel:              envOrDefault("OPENAI_MODEL", "gpt-5.6-sol"),
 		OpenAIImageDetail:        envOrDefault("OPENAI_IMAGE_DETAIL", "high"),
 		WebhookSecret:            os.Getenv("WEBHOOK_SECRET"),
 		SnapshotDelay:            5 * time.Second,

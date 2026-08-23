@@ -27,7 +27,7 @@ Bambuddy 1.2.5 does not provide atomic "clear this exact gate generation" or "pa
 
 - Bambuddy 1.2.5 or newer
 - A usable Bambuddy camera snapshot endpoint
-- An OpenAI API key with Responses API access to `gpt-5.6-terra`
+- An OpenAI API key with Responses API access to `gpt-5.6-sol`
 - Go 1.22 or newer when building from source
 
 ## Build And Test
@@ -51,7 +51,7 @@ Configuration is read from environment variables.
 | `BAMBUDDY_URL` | Yes | - | Bambuddy base URL, such as `http://100.109.149.34:8000` |
 | `BAMBUDDY_API_KEY` | With Bambuddy auth | Empty | Restricted Bambuddy key sent as `X-API-Key` |
 | `OPENAI_API_KEY` | Yes | - | OpenAI project API key |
-| `OPENAI_MODEL` | No | `gpt-5.6-terra` | Vision model used for plate and first-layer assessments |
+| `OPENAI_MODEL` | No | `gpt-5.6-sol` | Vision model used for plate and first-layer assessments |
 | `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI Responses API base URL |
 | `OPENAI_IMAGE_DETAIL` | No | `high` | `low`, `high`, or `auto` |
 | `WEBHOOK_SECRET` | Yes | - | Shared bearer token for incoming webhooks |

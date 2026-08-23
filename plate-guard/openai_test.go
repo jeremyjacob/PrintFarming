@@ -35,7 +35,9 @@ func TestOpenAIAssessUsesVisionAndStructuredOutput(t *testing.T) {
 			`normal fixed-camera view`,
 			`full perimeter`,
 			`toolhead`,
-			`do not demand a full top-down view`,
+			`broad, flat, dark textured plane`,
+			`discrete freestanding geometry`,
+			`do not invent objects from lighting`,
 		} {
 			if !strings.Contains(requestJSON, required) {
 				t.Fatalf("plate-clear request missing %q: %s", required, requestJSON)
@@ -95,7 +97,7 @@ func TestOpenAIAssessRequiresCompletedStatus(t *testing.T) {
 	client := &openAIClient{
 		apiKey:      "openai-key",
 		baseURL:     server.URL,
-		model:       "gpt-5.6-terra",
+		model:       "gpt-5.6-sol",
 		imageDetail: "high",
 		httpClient:  server.Client(),
 	}
