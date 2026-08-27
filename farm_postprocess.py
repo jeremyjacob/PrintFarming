@@ -10,7 +10,7 @@ After the normal P1S end G-code it:
   1. Removes Bambu's default final bed-lowering/current-reduction block.
   2. Turns the bed heater off and waits for the bed to cool.
   3. Moves the toolhead to X center / rear Y before large Z moves.
-  4. Cycles the bed from 20 mm above bottom to 40 mm higher, 2 times.
+  4. Cycles the bed from 20 mm above bottom to 40 mm higher, 4 times.
   5. Raises the bed to a push height derived from the actual print height.
   6. Pushes the loosened part frontward in three tight X tracks: center, left, then right.
   7. Lowers the bed below the part before every fast rearward reposition.
@@ -43,8 +43,8 @@ from pathlib import Path
 COOL_TEMP_C = 44.0
 
 # Some P1S firmware exits an M190 R cooling wait near 45 C when the temperature
-# decline becomes too slow. Keep exhausting the chamber for three more minutes.
-COOL_FALLBACK_DWELL_SECONDS = 180
+# decline becomes too slow. Keep exhausting the chamber for five more minutes.
+COOL_FALLBACK_DWELL_SECONDS = 300
 
 # P1S nominal Z travel / build height.
 Z_BOTTOM_MM = 256.0
@@ -56,7 +56,7 @@ FLEX_BOTTOM_Z_MM = 236.0
 # Flex upward from that lower endpoint.
 FLEX_STROKE_MM = 40
 FLEX_UP_Z_MM = FLEX_BOTTOM_Z_MM - FLEX_STROKE_MM
-FLEX_CYCLES = 2
+FLEX_CYCLES = 4
 
 # Motion speeds in mm/min.
 Z_FLEX_FEED = 900        # 15 mm/s
