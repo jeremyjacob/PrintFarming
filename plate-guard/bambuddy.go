@@ -38,6 +38,7 @@ type plateGateStatus struct {
 	SubtaskName        string `json:"subtask_name"`
 	GcodeFile          string `json:"gcode_file"`
 	LayerNum           int    `json:"layer_num"`
+	LeftAuxFanSpeed    *int   `json:"left_aux_fan_speed"`
 }
 
 type terminalJob struct {
@@ -373,6 +374,59 @@ func (c *bambuddyClient) pausePrint(ctx context.Context, printerID int) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return responseError("pause Bambuddy print", resp)
+	}
+	return nil
+}
+
+func (c *bambuddyClient) enableAMSFilamentBackup(ctx context.Context, printerID int) error {
+	path := "/api/v1/printers/" + strconv.Itoa(printerID) + "/ams-backup"
+	u := c.endpoint(path)
+	query := u.Query()
+	query.Set("enabled", "true")
+	u.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	c.addAuthentication(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("enable AMS filament backup: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return responseError("enable AMS filament backup", resp)
+	}
+	return nil
+}
+
+func (c *bambuddyClient) setFanSpeed(ctx context.Context, printerID int, fan string, speed int) error {
+	switch fan {
+	case "aux", "aux2", "chamber":
+	default:
+		return fmt.Errorf("unsupported fan %q", fan)
+	}
+	if speed < 0 || speed > 100 {
+		return fmt.Errorf("fan speed must be between 0 and 100")
+	}
+	path := "/api/v1/printers/" + strconv.Itoa(printerID) + "/fan-speed"
+	u := c.endpoint(path)
+	query := u.Query()
+	query.Set("fan", fan)
+	query.Set("speed", strconv.Itoa(speed))
+	u.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	c.addAuthentication(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("set Bambuddy %s fan speed to %d: %w", fan, speed, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return responseError(fmt.Sprintf("set Bambuddy %s fan speed to %d", fan, speed), resp)
 	}
 	return nil
 }

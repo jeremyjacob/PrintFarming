@@ -66,7 +66,7 @@ func main() {
 	}
 	serverErrors := make(chan error, 1)
 	go func() {
-		logger.Printf("starting bambuddy-plate-guard version=%s listen=%s model=%s workers=%d dry_run=%t", version, cfg.ListenAddr, cfg.OpenAIModel, cfg.WorkerCount, cfg.DryRun)
+		logger.Printf("starting bambuddy-plate-guard version=%s listen=%s model=%s workers=%d ams_backup_after_first_layer=%t post_print_fan_duration=%s post_print_fan_speed=%d dry_run=%t", version, cfg.ListenAddr, cfg.OpenAIModel, cfg.WorkerCount, cfg.EnableAMSBackup, cfg.PostPrintFanDuration, cfg.PostPrintFanSpeed, cfg.DryRun)
 		serverErrors <- server.ListenAndServe()
 	}()
 

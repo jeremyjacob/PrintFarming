@@ -1,6 +1,6 @@
 # Bambuddy Plate Guard
 
-`bambuddy-plate-guard` is a local Go service that checks first-layer quality, pauses confirmed failures, keeps Bambuddy's queue gated after any terminal queued print, and releases the next print only when fresh camera images show that the build plate is confidently empty.
+`bambuddy-plate-guard` is a local Go service that checks first-layer quality, pauses confirmed failures, restores AMS Filament Backup after a reviewed first layer, runs post-success cooling fans, keeps Bambuddy's queue gated after any terminal queued print, and releases the next print only when fresh camera images show that the build plate is confidently empty.
 
 The queue-release path fails closed:
 
@@ -10,6 +10,7 @@ The queue-release path fails closed:
 - Both OpenAI assessments must find the normal fixed-camera view usable and show no retained part or obstruction. A full view of every plate edge is not required.
 - Camera, OpenAI, Bambuddy, timeout, stale-event, and uncertain-result failures do not send a clear request.
 - It maps completed, failed, and stopped webhooks to their exact terminal queue statuses, then rechecks the same queue job and printer gate immediately before calling Bambuddy's `clear-plate` endpoint.
+- After a validated successful completion, it runs the auxiliary and chamber fans at full speed for five minutes, plus the left auxiliary fan when Bambuddy reports one. It stops the fans before image assessment and keeps the queue gated if the fan cycle fails.
 
 The first-layer path is deliberately conservative against false pauses:
 
@@ -19,6 +20,7 @@ The first-layer path is deliberately conservative against false pauses:
 - Both assessments must classify a visible, major physical defect before Plate Guard can pause the print.
 - Unclear images, API failures, low confidence, and disagreement let the print continue.
 - It rechecks the connection, queue-item ID/start time, print identity, and non-reset layer counter immediately before requesting a pause.
+- After a completed review does not confirm a failure, it repeats the same active-print checks and enables AMS Filament Backup through Bambuddy's printer API. It does not enable backup for a confirmed failure, an expired event, or a print that changed during review.
 - It never stops, resumes, or starts a printer directly.
 
 Bambuddy 1.2.5 does not provide atomic "clear this exact gate generation" or "pause this exact print generation" operations. A manual action can theoretically change printer state between a final status check and its control request. Do not manually clear a gate or replace/resume a print while Plate Guard is processing the corresponding webhook.
@@ -61,7 +63,10 @@ Configuration is read from environment variables.
 | `SNAPSHOT_DELAY` | No | `5s` | Delay before the first fresh snapshot |
 | `WORKER_COUNT` | No | `4` | Concurrent workers; jobs for one printer remain serialized |
 | `AUTO_ENABLE_PLATE_CLEAR` | No | `true` | Attempt to enable `require_plate_clear` during startup |
-| `DRY_RUN` | No | `false` | Analyze and revalidate without sending pause or `clear-plate` requests |
+| `ENABLE_AMS_BACKUP_AFTER_FIRST_LAYER` | No | `true` | Enable AMS Filament Backup after a completed first-layer review does not confirm a failure |
+| `POST_PRINT_FAN_DURATION` | No | `5m` | Successful-completion fan-cycle duration; `0s` disables it |
+| `POST_PRINT_FAN_SPEED` | No | `100` | Auxiliary, chamber, and optional left-aux fan speed from 1 to 100 percent |
+| `DRY_RUN` | No | `false` | Analyze and revalidate without sending fan, pause, AMS-backup, or `clear-plate` requests |
 | `BAMBUDDY_TIMEOUT` | No | `15s` | Timeout for each Bambuddy request |
 | `OPENAI_TIMEOUT` | No | `60s` | Timeout for each OpenAI request |
 | `SHUTDOWN_TIMEOUT` | No | `5m` | Maximum drain time; values above `5m` are rejected to match the unit |
@@ -114,7 +119,17 @@ If Bambuddy authentication is enabled, create a dedicated key with:
 - Control printer: enabled
 - Queue, library, inventory, maintenance, archives, projects, and cloud management: disabled
 
-Read status permits the status, queue-read, settings-read, camera-view, and temporary camera-token calls used by the service. Control printer is required for both `printers:clear_plate` and print pause. The service requests a fresh 60-minute camera token automatically; no camera token belongs in the environment file.
+Read status permits the status, queue-read, settings-read, camera-view, and temporary camera-token calls used by the service. Control printer is required for `printers:clear_plate`, fan control, print pause, and the AMS Filament Backup update. The service requests a fresh 60-minute camera token automatically; no camera token belongs in the environment file.
+
+After a completed first-layer review that does not confirm a failure, Plate Guard calls:
+
+```http
+POST /api/v1/printers/{printer_id}/ams-backup?enabled=true
+```
+
+Set `ENABLE_AMS_BACKUP_AFTER_FIRST_LAYER=false` to disable this behavior. This is a per-printer control request; Plate Guard revalidates the active printer and queue job immediately before sending it.
+
+For a matching `print_complete` event, Plate Guard keeps the queue gated while it calls `POST /api/v1/printers/{printer_id}/fan-speed` for `aux` and `chamber`, and for `aux2` when `left_aux_fan_speed` is present in printer status. It sets each fan to `POST_PRINT_FAN_SPEED`, waits `POST_PRINT_FAN_DURATION`, sets each attempted fan to zero, and only then begins empty-plate assessment. Failed and stopped prints do not run this cycle. A startup or cleanup error holds the gate for manual review.
 
 Bambuddy 1.2.5 does not consistently enforce an API key's printer allowlist on these routes. Treat the API key as able to read and clear all printers until that is fixed upstream, keep the webhook secret private, and firewall the listener to Bambuddy's network.
 
@@ -192,11 +207,11 @@ The unit uses a dynamic unprivileged user, a read-only filesystem, no Linux capa
 1. Set `DRY_RUN=true`.
 2. Start the service and send Bambuddy's webhook provider test.
 3. If the gate was enabled after a print had already finished, clear that pre-existing gate manually; it has no webhook for the daemon to process.
-4. Run a first-layer test and inspect the specialized classification and final active-print revalidation in the journal. Confirm that `DRY_RUN=true` does not pause it.
-5. Complete an ejection test print and inspect both empty-plate classifications and the final gate/job revalidation.
+4. Run a first-layer test and inspect the specialized classification and final active-print revalidation in the journal. Confirm that `DRY_RUN=true` neither pauses it nor changes AMS Filament Backup.
+5. Complete an ejection test print and inspect the five-minute fan cycle, both empty-plate classifications, and the final gate/job revalidation.
 6. Confirm the plate-clear gate remains active in Bambuddy, then clear it manually.
 7. Set `DRY_RUN=false` and restart the service.
-8. Test a healthy first layer, a clearly failed first layer, successful ejection, an occupied plate, an obscured or dark camera, and a deliberately failed OpenAI request before loading a production queue.
+8. Test a healthy first layer and confirm AMS Filament Backup becomes enabled, then test a clearly failed first layer, successful ejection, an occupied plate, an obscured or dark camera, and a deliberately failed OpenAI request before loading a production queue.
 
 ```bash
 sudo systemctl restart bambuddy-plate-guard
@@ -206,7 +221,7 @@ If an assessment holds a plate, remove the obstruction and use Bambuddy's normal
 
 If Plate Guard pauses a first-layer failure, inspect the print and use Bambuddy's normal stop or resume control. Plate Guard never resumes automatically.
 
-If a pause or `clear-plate` request times out after delivery, the result is inherently unknown: Bambuddy may have processed it before the response was lost. Plate Guard logs this case explicitly.
+If a fan, pause, AMS-backup, or `clear-plate` request times out after delivery, the result is inherently unknown: Bambuddy may have processed it before the response was lost. Plate Guard logs this case explicitly and attempts to stop every fan whose startup was attempted.
 
 ## HTTP Endpoints
 

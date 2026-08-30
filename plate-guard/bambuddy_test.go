@@ -15,6 +15,8 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	requirePlateClear := false
 	clearCalled := false
 	pauseCalled := false
+	amsBackupCalled := false
+	var fanCalls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-API-Key") != "bambuddy-key" {
 			http.Error(w, "missing API key", http.StatusUnauthorized)
@@ -38,6 +40,20 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/printers/7/print/pause":
 			mu.Lock()
 			pauseCalled = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/printers/7/ams-backup":
+			if r.URL.Query().Get("enabled") != "true" {
+				http.Error(w, "missing enabled=true", http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			amsBackupCalled = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/printers/7/fan-speed":
+			mu.Lock()
+			fanCalls = append(fanCalls, r.URL.Query().Get("fan")+"="+r.URL.Query().Get("speed"))
 			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/printers/7/status":
@@ -130,6 +146,15 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	if err := client.pausePrint(context.Background(), 7); err != nil {
 		t.Fatal(err)
 	}
+	if err := client.enableAMSFilamentBackup(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.setFanSpeed(context.Background(), 7, "aux2", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.setFanSpeed(context.Background(), 7, "aux2", 0); err != nil {
+		t.Fatal(err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if !clearCalled {
@@ -137,6 +162,12 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	}
 	if !pauseCalled {
 		t.Fatal("pause endpoint was not called")
+	}
+	if !amsBackupCalled {
+		t.Fatal("AMS backup endpoint was not called")
+	}
+	if len(fanCalls) != 2 || fanCalls[0] != "aux2=100" || fanCalls[1] != "aux2=0" {
+		t.Fatalf("unexpected fan calls: %v", fanCalls)
 	}
 }
 

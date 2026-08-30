@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -26,6 +27,17 @@ type fakeController struct {
 	plateClearActive bool
 	snapshotCalls    int
 	staticSnapshots  bool
+	amsBackupCalls   int
+	amsBackupErr     error
+	fanCalls         []fanCall
+	fanErrors        map[fanCall]error
+	fanBlocks        map[fanCall]<-chan struct{}
+	fanStarted       chan fanCall
+}
+
+type fanCall struct {
+	fan   string
+	speed int
 }
 
 func (f *fakeController) snapshot(context.Context, int) ([]byte, string, error) {
@@ -97,6 +109,33 @@ func (f *fakeController) pausePrint(_ context.Context, printerID int) error {
 	return nil
 }
 
+func (f *fakeController) enableAMSFilamentBackup(context.Context, int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.amsBackupCalls++
+	return f.amsBackupErr
+}
+
+func (f *fakeController) setFanSpeed(_ context.Context, _ int, fan string, speed int) error {
+	f.mu.Lock()
+	call := fanCall{fan: fan, speed: speed}
+	f.fanCalls = append(f.fanCalls, call)
+	err := f.fanErrors[call]
+	block := f.fanBlocks[call]
+	started := f.fanStarted
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- call:
+		default:
+		}
+	}
+	if block != nil {
+		<-block
+	}
+	return err
+}
+
 type fakeAssessor struct {
 	mu                    sync.Mutex
 	assessment            plateAssessment
@@ -129,6 +168,7 @@ func testConfig() config {
 		EventMaxAge:      5 * time.Minute,
 		BambuddyTimezone: time.UTC,
 		WorkerCount:      1,
+		EnableAMSBackup:  true,
 	}
 }
 
@@ -250,7 +290,146 @@ func TestFailedAndStoppedWebhooksCanReleaseClearGate(t *testing.T) {
 			default:
 				t.Fatal("matching terminal webhook did not release a clear gate")
 			}
+			controller.mu.Lock()
+			defer controller.mu.Unlock()
+			if len(controller.fanCalls) != 0 {
+				t.Fatalf("%s must not start a successful-completion fan cycle: %v", test.eventType, controller.fanCalls)
+			}
 		})
+	}
+}
+
+func TestSuccessfulCompletionRunsPostPrintFanCycle(t *testing.T) {
+	now := time.Now()
+	leftAuxSpeed := 0
+	gate := plateGateStatus{
+		ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf",
+		LeftAuxFanSpeed: &leftAuxSpeed,
+	}
+	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}
+	controller := &fakeController{
+		cleared:          make(chan int, 1),
+		gateStatuses:     []plateGateStatus{gate, gate},
+		terminalJobs:     []terminalJob{terminal, terminal},
+		plateClearActive: true,
+	}
+	cfg := testConfig()
+	cfg.PostPrintFanDuration = time.Millisecond
+	cfg.PostPrintFanSpeed = 100
+	svc := newService(cfg, controller, &fakeAssessor{assessment: plateAssessment{PlateVisible: true, IsEmpty: true}}, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
+
+	select {
+	case <-controller.cleared:
+	default:
+		t.Fatal("successful completion was not released after the fan cycle")
+	}
+	want := []fanCall{
+		{fan: "aux", speed: 100},
+		{fan: "chamber", speed: 100},
+		{fan: "aux2", speed: 100},
+		{fan: "aux", speed: 0},
+		{fan: "chamber", speed: 0},
+		{fan: "aux2", speed: 0},
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if len(controller.fanCalls) != len(want) {
+		t.Fatalf("unexpected fan calls: %+v", controller.fanCalls)
+	}
+	for i := range want {
+		if controller.fanCalls[i] != want[i] {
+			t.Fatalf("fan call %d: got %+v want %+v", i, controller.fanCalls[i], want[i])
+		}
+	}
+}
+
+func TestPostPrintFanFailureKeepsGateClosedAndStopsAttemptedFans(t *testing.T) {
+	now := time.Now()
+	gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"}
+	controller := &fakeController{
+		cleared:      make(chan int, 1),
+		gateStatuses: []plateGateStatus{gate},
+		terminalJobs: []terminalJob{{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}},
+		fanErrors:    map[fanCall]error{{fan: "chamber", speed: 100}: fmt.Errorf("test failure")},
+	}
+	cfg := testConfig()
+	cfg.PostPrintFanDuration = time.Millisecond
+	cfg.PostPrintFanSpeed = 100
+	svc := newService(cfg, controller, &fakeAssessor{}, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
+
+	select {
+	case <-controller.cleared:
+		t.Fatal("fan-cycle failure must keep the plate gated")
+	default:
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.snapshotCalls != 0 {
+		t.Fatal("plate assessment should not start after a fan-cycle failure")
+	}
+	want := []fanCall{{fan: "aux", speed: 100}, {fan: "chamber", speed: 100}, {fan: "aux", speed: 0}, {fan: "chamber", speed: 0}}
+	if len(controller.fanCalls) != len(want) {
+		t.Fatalf("unexpected fan cleanup calls: %+v", controller.fanCalls)
+	}
+	for i := range want {
+		if controller.fanCalls[i] != want[i] {
+			t.Fatalf("fan call %d: got %+v want %+v", i, controller.fanCalls[i], want[i])
+		}
+	}
+}
+
+func TestFanCleanupOwnershipBlocksShutdownClaimUntilStopsFinish(t *testing.T) {
+	releaseStop := make(chan struct{})
+	controller := &fakeController{
+		fanBlocks:  map[fanCall]<-chan struct{}{{fan: "aux", speed: 0}: releaseStop},
+		fanStarted: make(chan fanCall, 8),
+	}
+	cfg := testConfig()
+	cfg.PostPrintFanDuration = time.Millisecond
+	cfg.PostPrintFanSpeed = 100
+	svc := newService(cfg, controller, &fakeAssessor{}, log.New(io.Discard, "", 0))
+	cycleDone := make(chan error, 1)
+	go func() { cycleDone <- svc.runPostPrintFanCycle(context.Background(), 7, false) }()
+
+	for {
+		select {
+		case call := <-controller.fanStarted:
+			if call == (fanCall{fan: "aux", speed: 0}) {
+				goto stopStarted
+			}
+		case <-time.After(time.Second):
+			close(releaseStop)
+			t.Fatal("fan cleanup did not start")
+		}
+	}
+
+stopStarted:
+	claimDone := make(chan struct{})
+	go func() {
+		svc.claimAllPostPrintFans()
+		close(claimDone)
+	}()
+	select {
+	case <-claimDone:
+		close(releaseStop)
+		t.Fatal("shutdown claimed fan ownership while worker cleanup was still in flight")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseStop)
+	select {
+	case err := <-cycleDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fan cycle did not finish after cleanup was released")
+	}
+	select {
+	case <-claimDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown claim did not finish after fan cleanup")
 	}
 }
 
@@ -304,6 +483,101 @@ func TestFirstLayerWebhookPausesOnlyAfterTwoDefectClassifications(t *testing.T) 
 	if controller.snapshotCalls != 2 || controller.gateCalls != 2 {
 		t.Fatalf("expected two snapshots and two status checks, got snapshots=%d status=%d", controller.snapshotCalls, controller.gateCalls)
 	}
+	if controller.amsBackupCalls != 0 {
+		t.Fatal("a confirmed first-layer failure must not enable AMS filament backup")
+	}
+}
+
+func TestHealthyFirstLayerEnablesAMSBackupAfterRevalidation(t *testing.T) {
+	now := time.Now()
+	status := plateGateStatus{
+		ID: 7, Name: "P1S", Connected: true, State: "RUNNING",
+		CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+	}
+	controller := &fakeController{
+		paused:       make(chan int, 1),
+		activeJobs:   []activeQueueJob{testActiveJob(now), testActiveJob(now)},
+		gateStatuses: []plateGateStatus{status, status},
+	}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{{
+		FirstLayerVisible: true,
+		IsDefective:       false,
+		Confidence:        0.999,
+		Reason:            "The first layer is uniformly bonded.",
+	}}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	select {
+	case <-controller.paused:
+		t.Fatal("a healthy first layer must not pause")
+	default:
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.amsBackupCalls != 1 {
+		t.Fatalf("expected one AMS backup request, got %d", controller.amsBackupCalls)
+	}
+	if controller.snapshotCalls != 1 || controller.gateCalls != 2 || controller.activeCalls != 2 {
+		t.Fatalf(
+			"expected review plus active-print revalidation, got snapshots=%d status=%d active_jobs=%d",
+			controller.snapshotCalls,
+			controller.gateCalls,
+			controller.activeCalls,
+		)
+	}
+}
+
+func TestHealthyFirstLayerDoesNotEnableBackupForReplacementPrint(t *testing.T) {
+	now := time.Now()
+	controller := &fakeController{
+		paused:     make(chan int, 1),
+		activeJobs: []activeQueueJob{testActiveJob(now)},
+		gateStatuses: []plateGateStatus{
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2},
+			{ID: 7, Name: "P1S", Connected: true, State: "RUNNING", CurrentPrint: "replacement.3mf", SubtaskName: "replacement.3mf", LayerNum: 2},
+		},
+	}
+	assessor := &fakeAssessor{firstLayerAssessments: []firstLayerAssessment{{
+		FirstLayerVisible: true,
+		IsDefective:       false,
+	}}}
+	svc := newService(testConfig(), controller, assessor, log.New(io.Discard, "", 0))
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.amsBackupCalls != 0 {
+		t.Fatal("a replacement print must not inherit an earlier print's AMS backup action")
+	}
+}
+
+func TestHealthyFirstLayerDryRunDoesNotEnableAMSBackup(t *testing.T) {
+	now := time.Now()
+	status := plateGateStatus{
+		ID: 7, Name: "P1S", Connected: true, State: "RUNNING",
+		CurrentPrint: "part.3mf", SubtaskName: "part.3mf", LayerNum: 2,
+	}
+	controller := &fakeController{
+		paused:       make(chan int, 1),
+		activeJobs:   []activeQueueJob{testActiveJob(now), testActiveJob(now)},
+		gateStatuses: []plateGateStatus{status, status},
+	}
+	cfg := testConfig()
+	cfg.DryRun = true
+	svc := newService(
+		cfg,
+		controller,
+		&fakeAssessor{firstLayerAssessments: []firstLayerAssessment{{FirstLayerVisible: true}}},
+		log.New(io.Discard, "", 0),
+	)
+	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: firstLayerEvent(now), EventTime: now})
+
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if controller.amsBackupCalls != 0 {
+		t.Fatal("dry run must not enable AMS filament backup")
+	}
 }
 
 func TestFirstLayerAmbiguityDoesNotPause(t *testing.T) {
@@ -331,8 +605,13 @@ func TestFirstLayerAmbiguityDoesNotPause(t *testing.T) {
 	}
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
-	if controller.snapshotCalls != 1 || controller.gateCalls != 1 {
-		t.Fatalf("ambiguous result should stop after one assessment, got snapshots=%d status=%d", controller.snapshotCalls, controller.gateCalls)
+	if controller.snapshotCalls != 1 || controller.gateCalls != 2 || controller.amsBackupCalls != 1 {
+		t.Fatalf(
+			"ambiguous review should continue with AMS backup, got snapshots=%d status=%d backup=%d",
+			controller.snapshotCalls,
+			controller.gateCalls,
+			controller.amsBackupCalls,
+		)
 	}
 }
 
@@ -359,8 +638,13 @@ func TestFirstLayerFailureRequiresIndependentConfirmation(t *testing.T) {
 	}
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
-	if controller.snapshotCalls != 2 || controller.gateCalls != 1 {
-		t.Fatalf("expected two assessments without final action check, got snapshots=%d status=%d", controller.snapshotCalls, controller.gateCalls)
+	if controller.snapshotCalls != 2 || controller.gateCalls != 2 || controller.amsBackupCalls != 1 {
+		t.Fatalf(
+			"expected two assessments then AMS backup, got snapshots=%d status=%d backup=%d",
+			controller.snapshotCalls,
+			controller.gateCalls,
+			controller.amsBackupCalls,
+		)
 	}
 }
 
@@ -625,6 +909,8 @@ func TestDryRunExecutesAllSafetyChecks(t *testing.T) {
 	}}
 	cfg := testConfig()
 	cfg.DryRun = true
+	cfg.PostPrintFanDuration = 5 * time.Minute
+	cfg.PostPrintFanSpeed = 100
 	svc := newService(cfg, controller, assessor, log.New(io.Discard, "", 0))
 	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
 
@@ -642,6 +928,9 @@ func TestDryRunExecutesAllSafetyChecks(t *testing.T) {
 			controller.gateCalls,
 			controller.terminalCalls,
 		)
+	}
+	if len(controller.fanCalls) != 0 {
+		t.Fatalf("dry run sent fan commands: %+v", controller.fanCalls)
 	}
 }
 
@@ -875,6 +1164,14 @@ func (c *schedulingController) clearPlate(context.Context, int) error {
 }
 
 func (c *schedulingController) pausePrint(context.Context, int) error {
+	return nil
+}
+
+func (c *schedulingController) enableAMSFilamentBackup(context.Context, int) error {
+	return nil
+}
+
+func (c *schedulingController) setFanSpeed(context.Context, int, string, int) error {
 	return nil
 }
 

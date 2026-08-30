@@ -24,6 +24,9 @@ type config struct {
 	WorkerCount          int
 	ShutdownTimeout      time.Duration
 	AutoEnablePlateClear bool
+	EnableAMSBackup      bool
+	PostPrintFanDuration time.Duration
+	PostPrintFanSpeed    int
 	DryRun               bool
 	BambuddyTimeout      time.Duration
 	OpenAITimeout        time.Duration
@@ -44,6 +47,9 @@ func loadConfig() (config, error) {
 		WorkerCount:          4,
 		ShutdownTimeout:      5 * time.Minute,
 		AutoEnablePlateClear: true,
+		EnableAMSBackup:      true,
+		PostPrintFanDuration: 5 * time.Minute,
+		PostPrintFanSpeed:    100,
 		BambuddyTimeout:      15 * time.Second,
 		OpenAITimeout:        60 * time.Second,
 	}
@@ -70,6 +76,15 @@ func loadConfig() (config, error) {
 	if cfg.AutoEnablePlateClear, err = envBool("AUTO_ENABLE_PLATE_CLEAR", cfg.AutoEnablePlateClear); err != nil {
 		return config{}, err
 	}
+	if cfg.EnableAMSBackup, err = envBool("ENABLE_AMS_BACKUP_AFTER_FIRST_LAYER", cfg.EnableAMSBackup); err != nil {
+		return config{}, err
+	}
+	if cfg.PostPrintFanDuration, err = envDuration("POST_PRINT_FAN_DURATION", cfg.PostPrintFanDuration); err != nil {
+		return config{}, err
+	}
+	if cfg.PostPrintFanSpeed, err = envInt("POST_PRINT_FAN_SPEED", cfg.PostPrintFanSpeed); err != nil {
+		return config{}, err
+	}
 	if cfg.DryRun, err = envBool("DRY_RUN", false); err != nil {
 		return config{}, err
 	}
@@ -94,6 +109,12 @@ func loadConfig() (config, error) {
 	}
 	if cfg.EventMaxAge <= 0 {
 		return config{}, fmt.Errorf("EVENT_MAX_AGE must be greater than zero")
+	}
+	if cfg.PostPrintFanDuration < 0 {
+		return config{}, fmt.Errorf("POST_PRINT_FAN_DURATION cannot be negative")
+	}
+	if cfg.PostPrintFanDuration > 0 && (cfg.PostPrintFanSpeed < 1 || cfg.PostPrintFanSpeed > 100) {
+		return config{}, fmt.Errorf("POST_PRINT_FAN_SPEED must be between 1 and 100 when the fan cycle is enabled")
 	}
 	if cfg.ShutdownTimeout <= 0 || cfg.ShutdownTimeout > 5*time.Minute {
 		return config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be greater than zero and at most 5m")

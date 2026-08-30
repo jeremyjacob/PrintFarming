@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadConfigDefaults(t *testing.T) {
 	t.Setenv("BAMBUDDY_URL", "http://bambuddy:8000/")
@@ -9,6 +12,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", "")
 	t.Setenv("OPENAI_MODEL", "")
 	t.Setenv("AUTO_ENABLE_PLATE_CLEAR", "")
+	t.Setenv("ENABLE_AMS_BACKUP_AFTER_FIRST_LAYER", "")
+	t.Setenv("POST_PRINT_FAN_DURATION", "")
+	t.Setenv("POST_PRINT_FAN_SPEED", "")
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -25,6 +31,24 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if !cfg.AutoEnablePlateClear {
 		t.Fatal("auto-enable should default to true")
+	}
+	if !cfg.EnableAMSBackup {
+		t.Fatal("AMS backup after first-layer review should default to true")
+	}
+	if cfg.PostPrintFanDuration != 5*time.Minute || cfg.PostPrintFanSpeed != 100 {
+		t.Fatalf("unexpected post-print fan defaults: duration=%s speed=%d", cfg.PostPrintFanDuration, cfg.PostPrintFanSpeed)
+	}
+}
+
+func TestLoadConfigRejectsInvalidPostPrintFanSettings(t *testing.T) {
+	t.Setenv("BAMBUDDY_URL", "http://bambuddy:8000")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	t.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
+	t.Setenv("POST_PRINT_FAN_DURATION", "5m")
+	t.Setenv("POST_PRINT_FAN_SPEED", "0")
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("expected zero fan speed to fail when the fan cycle is enabled")
 	}
 }
 

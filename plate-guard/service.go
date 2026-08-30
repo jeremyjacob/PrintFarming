@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,6 +31,8 @@ type plateController interface {
 	plateClearEnabled(context.Context) (bool, error)
 	clearPlate(context.Context, int) error
 	pausePrint(context.Context, int) error
+	enableAMSFilamentBackup(context.Context, int) error
+	setFanSpeed(context.Context, int, string, int) error
 }
 
 type plateAssessor interface {
@@ -51,22 +54,28 @@ type plateJob struct {
 }
 
 type service struct {
-	controller    plateController
-	assessor      plateAssessor
-	logger        *log.Logger
-	webhookSecret string
-	snapshotDelay time.Duration
-	eventMaxAge   time.Duration
-	timezone      *time.Location
-	workerCount   int
-	dryRun        bool
-	jobs          chan plateJob
-	jobSlots      chan struct{}
-	workerSlots   chan struct{}
-	queueMu       sync.RWMutex
-	accepting     bool
-	workerCancel  context.CancelFunc
-	workerWG      sync.WaitGroup
+	controller           plateController
+	assessor             plateAssessor
+	logger               *log.Logger
+	webhookSecret        string
+	snapshotDelay        time.Duration
+	eventMaxAge          time.Duration
+	timezone             *time.Location
+	workerCount          int
+	enableAMSBackup      bool
+	postPrintFanDuration time.Duration
+	postPrintFanSpeed    int
+	dryRun               bool
+	jobs                 chan plateJob
+	jobSlots             chan struct{}
+	workerSlots          chan struct{}
+	queueMu              sync.RWMutex
+	accepting            bool
+	workerCancel         context.CancelFunc
+	workerWG             sync.WaitGroup
+	fanMu                sync.Mutex
+	activeFans           map[int][]string
+	fanShutdown          bool
 }
 
 func newService(cfg config, controller plateController, assessor plateAssessor, logger *log.Logger) *service {
@@ -75,18 +84,22 @@ func newService(cfg config, controller plateController, assessor plateAssessor, 
 		workerCount = 1
 	}
 	return &service{
-		controller:    controller,
-		assessor:      assessor,
-		logger:        logger,
-		webhookSecret: cfg.WebhookSecret,
-		snapshotDelay: cfg.SnapshotDelay,
-		eventMaxAge:   cfg.EventMaxAge,
-		timezone:      cfg.BambuddyTimezone,
-		workerCount:   workerCount,
-		dryRun:        cfg.DryRun,
-		jobs:          make(chan plateJob, 256),
-		jobSlots:      make(chan struct{}, 256),
-		workerSlots:   make(chan struct{}, workerCount),
+		controller:           controller,
+		assessor:             assessor,
+		logger:               logger,
+		webhookSecret:        cfg.WebhookSecret,
+		snapshotDelay:        cfg.SnapshotDelay,
+		eventMaxAge:          cfg.EventMaxAge,
+		timezone:             cfg.BambuddyTimezone,
+		workerCount:          workerCount,
+		enableAMSBackup:      cfg.EnableAMSBackup,
+		postPrintFanDuration: cfg.PostPrintFanDuration,
+		postPrintFanSpeed:    cfg.PostPrintFanSpeed,
+		dryRun:               cfg.DryRun,
+		jobs:                 make(chan plateJob, 256),
+		jobSlots:             make(chan struct{}, 256),
+		workerSlots:          make(chan struct{}, workerCount),
+		activeFans:           make(map[int][]string),
 	}
 }
 
@@ -262,6 +275,14 @@ func (s *service) shutdown(ctx context.Context) bool {
 		if cancel != nil {
 			cancel()
 		}
+		activeFans := s.claimAllPostPrintFans()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		for printerID, fans := range activeFans {
+			if err := s.stopPostPrintFans(cleanupCtx, printerID, fans); err != nil {
+				s.logger.Printf("forced-shutdown fan cleanup failed printer_id=%d: %v", printerID, err)
+			}
+		}
 		return false
 	}
 }
@@ -316,6 +337,12 @@ func (s *service) processCompletion(ctx context.Context, job plateJob) {
 		s.logger.Printf("plate remains gated printer_id=%d: webhook does not match latest terminal queue job", job.PrinterID)
 		return
 	}
+	if job.Event.Event == "print_complete" {
+		if err := s.runPostPrintFanCycle(ctx, job.PrinterID, initialGate.LeftAuxFanSpeed != nil); err != nil {
+			s.logger.Printf("plate remains gated printer_id=%d: post-print fan cycle failed: %v", job.PrinterID, err)
+			return
+		}
+	}
 
 	first, err := s.assessFreshSnapshot(ctx, job.PrinterID, s.snapshotDelay)
 	if err != nil {
@@ -368,6 +395,95 @@ func (s *service) processCompletion(ctx context.Context, job plateJob) {
 	s.logger.Printf("plate gate cleared printer_id=%d; Bambuddy may dispatch the next queued print", job.PrinterID)
 }
 
+func (s *service) runPostPrintFanCycle(ctx context.Context, printerID int, hasLeftAux bool) error {
+	if s.postPrintFanDuration <= 0 {
+		return nil
+	}
+	fans := []string{"aux", "chamber"}
+	if hasLeftAux {
+		fans = append(fans, "aux2")
+	}
+	if s.dryRun {
+		s.logger.Printf(
+			"dry run: would run post-print fan cycle printer_id=%d fans=%s speed=%d duration=%s",
+			printerID,
+			strings.Join(fans, ","),
+			s.postPrintFanSpeed,
+			s.postPrintFanDuration,
+		)
+		return nil
+	}
+
+	stopFans := func() error {
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		return s.stopRegisteredPostPrintFans(stopCtx, printerID)
+	}
+
+	for _, fan := range fans {
+		if err := s.startPostPrintFan(ctx, printerID, fan); err != nil {
+			return errors.Join(fmt.Errorf("start %s fan: %w", fan, err), stopFans())
+		}
+	}
+	s.logger.Printf(
+		"post-print fan cycle started printer_id=%d fans=%s speed=%d duration=%s",
+		printerID,
+		strings.Join(fans, ","),
+		s.postPrintFanSpeed,
+		s.postPrintFanDuration,
+	)
+
+	timer := time.NewTimer(s.postPrintFanDuration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return errors.Join(ctx.Err(), stopFans())
+	case <-timer.C:
+	}
+	if err := stopFans(); err != nil {
+		return err
+	}
+	s.logger.Printf("post-print fan cycle completed printer_id=%d fans=%s", printerID, strings.Join(fans, ","))
+	return nil
+}
+
+func (s *service) startPostPrintFan(ctx context.Context, printerID int, fan string) error {
+	s.fanMu.Lock()
+	defer s.fanMu.Unlock()
+	if s.fanShutdown {
+		return context.Canceled
+	}
+	s.activeFans[printerID] = append(s.activeFans[printerID], fan)
+	return s.controller.setFanSpeed(ctx, printerID, fan, s.postPrintFanSpeed)
+}
+
+func (s *service) stopRegisteredPostPrintFans(ctx context.Context, printerID int) error {
+	s.fanMu.Lock()
+	defer s.fanMu.Unlock()
+	fans := s.activeFans[printerID]
+	delete(s.activeFans, printerID)
+	return s.stopPostPrintFans(ctx, printerID, fans)
+}
+
+func (s *service) claimAllPostPrintFans() map[int][]string {
+	s.fanMu.Lock()
+	defer s.fanMu.Unlock()
+	s.fanShutdown = true
+	fans := s.activeFans
+	s.activeFans = make(map[int][]string)
+	return fans
+}
+
+func (s *service) stopPostPrintFans(ctx context.Context, printerID int, fans []string) error {
+	var stopErrors []error
+	for _, fan := range fans {
+		if err := s.controller.setFanSpeed(ctx, printerID, fan, 0); err != nil {
+			stopErrors = append(stopErrors, fmt.Errorf("stop %s fan: %w", fan, err))
+		}
+	}
+	return errors.Join(stopErrors...)
+}
+
 func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 	if time.Since(job.EventTime) > s.eventMaxAge {
 		s.logger.Printf("ignored stale first-layer event printer_id=%d", job.PrinterID)
@@ -405,6 +521,7 @@ func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 	s.logFirstLayerAssessment(job.PrinterID, "first", first)
 	if !s.certainFirstLayerFailure(first) {
 		s.logger.Printf("first-layer assessment did not justify a pause; print continues printer_id=%d", job.PrinterID)
+		s.enableAMSBackupForReviewedPrint(ctx, job, initialStatus, initialJob)
 		return
 	}
 
@@ -425,6 +542,7 @@ func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 	s.logFirstLayerAssessment(job.PrinterID, "confirmation", second)
 	if !s.certainFirstLayerFailure(second) {
 		s.logger.Printf("first-layer failure was not confirmed; print continues printer_id=%d", job.PrinterID)
+		s.enableAMSBackupForReviewedPrint(ctx, job, initialStatus, initialJob)
 		return
 	}
 	if time.Since(job.EventTime) > s.eventMaxAge {
@@ -455,6 +573,44 @@ func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 		return
 	}
 	s.logger.Printf("print pause requested after certain first-layer failure printer_id=%d", job.PrinterID)
+}
+
+func (s *service) enableAMSBackupForReviewedPrint(
+	ctx context.Context,
+	job plateJob,
+	initialStatus plateGateStatus,
+	initialJob activeQueueJob,
+) {
+	if !s.enableAMSBackup {
+		return
+	}
+	if time.Since(job.EventTime) > s.eventMaxAge {
+		s.logger.Printf("AMS filament backup not enabled printer_id=%d: first-layer event expired during review", job.PrinterID)
+		return
+	}
+	currentStatus, err := s.controller.gateStatus(ctx, job.PrinterID)
+	if err != nil {
+		s.logger.Printf("AMS filament backup not enabled printer_id=%d: cannot re-verify active print: %v", job.PrinterID, err)
+		return
+	}
+	if !sameActivePrint(initialStatus, currentStatus) {
+		s.logger.Printf("AMS filament backup not enabled printer_id=%d: active print changed during review", job.PrinterID)
+		return
+	}
+	currentJob, err := s.controller.activeQueueJob(ctx, job.PrinterID)
+	if err != nil || !sameActiveJob(initialJob, currentJob) {
+		s.logger.Printf("AMS filament backup not enabled printer_id=%d: active queue job changed during review", job.PrinterID)
+		return
+	}
+	if s.dryRun {
+		s.logger.Printf("dry run: first-layer review passed; would enable AMS filament backup printer_id=%d", job.PrinterID)
+		return
+	}
+	if err := s.controller.enableAMSFilamentBackup(ctx, job.PrinterID); err != nil {
+		s.logger.Printf("AMS filament backup outcome unknown printer_id=%d: request failed after possible delivery: %v", job.PrinterID, err)
+		return
+	}
+	s.logger.Printf("AMS filament backup enabled after first-layer review printer_id=%d", job.PrinterID)
 }
 
 func (s *service) assessFreshSnapshot(ctx context.Context, printerID int, delay time.Duration) (plateAssessment, error) {
