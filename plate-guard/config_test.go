@@ -38,6 +38,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.PostPrintFanDuration != 5*time.Minute || cfg.PostPrintFanSpeed != 100 {
 		t.Fatalf("unexpected post-print fan defaults: duration=%s speed=%d", cfg.PostPrintFanDuration, cfg.PostPrintFanSpeed)
 	}
+	if cfg.PostPrintFanStateFile != "/var/lib/bambuddy-plate-guard/fan-cycles.json" {
+		t.Fatalf("unexpected post-print fan state file: %q", cfg.PostPrintFanStateFile)
+	}
 }
 
 func TestLoadConfigRejectsInvalidPostPrintFanSettings(t *testing.T) {
@@ -45,10 +48,32 @@ func TestLoadConfigRejectsInvalidPostPrintFanSettings(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-openai-key")
 	t.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
 	t.Setenv("POST_PRINT_FAN_DURATION", "5m")
-	t.Setenv("POST_PRINT_FAN_SPEED", "0")
+	t.Setenv("POST_PRINT_FAN_SPEED", "3")
 
 	if _, err := loadConfig(); err == nil {
-		t.Fatal("expected zero fan speed to fail when the fan cycle is enabled")
+		t.Fatal("expected a fan speed that quantizes to off to fail when the fan cycle is enabled")
+	}
+}
+
+func TestLoadConfigRejectsExcessivePostPrintFanDuration(t *testing.T) {
+	t.Setenv("BAMBUDDY_URL", "http://bambuddy:8000")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	t.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
+	t.Setenv("POST_PRINT_FAN_DURATION", "2h")
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("expected excessive post-print fan duration to fail")
+	}
+}
+
+func TestLoadConfigRejectsRelativePostPrintFanStateFile(t *testing.T) {
+	t.Setenv("BAMBUDDY_URL", "http://bambuddy:8000")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	t.Setenv("WEBHOOK_SECRET", "test-webhook-secret")
+	t.Setenv("POST_PRINT_FAN_STATE_FILE", "fan-cycles.json")
+
+	if _, err := loadConfig(); err == nil {
+		t.Fatal("expected relative post-print fan state file to fail")
 	}
 }
 

@@ -65,6 +65,8 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 				State:              "FINISH",
 				SubtaskName:        "part",
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/printers/7":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 7, "model": "P1S"})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/printers/camera/stream-token":
 			_ = json.NewEncoder(w).Encode(map[string]string{"token": "camera-token"})
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/printers/7/camera/snapshot":
@@ -118,6 +120,13 @@ func TestBambuddyEnsureGateAndClearPlate(t *testing.T) {
 	}
 	if !status.Connected || !status.AwaitingPlateClear || status.SubtaskName != "part" {
 		t.Fatalf("unexpected gate status: %+v", status)
+	}
+	model, err := client.printerModel(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model != "P1S" {
+		t.Fatalf("unexpected printer model: %q", model)
 	}
 	terminal, err := client.latestTerminalJob(context.Background(), 7)
 	if err != nil {

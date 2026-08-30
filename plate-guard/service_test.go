@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ type fakeController struct {
 	fanErrors        map[fanCall]error
 	fanBlocks        map[fanCall]<-chan struct{}
 	fanStarted       chan fanCall
+	model            string
 }
 
 type fanCall struct {
@@ -49,6 +51,13 @@ func (f *fakeController) snapshot(context.Context, int) ([]byte, string, error) 
 	}
 	f.mu.Unlock()
 	return []byte{0xff, 0xd8, 0xff, 0xdb, byte(call)}, "image/jpeg", nil
+}
+
+func (f *fakeController) printerModel(context.Context, int) (string, error) {
+	if f.model != "" {
+		return f.model, nil
+	}
+	return "P1S", nil
 }
 
 func (f *fakeController) gateStatus(context.Context, int) (plateGateStatus, error) {
@@ -116,7 +125,7 @@ func (f *fakeController) enableAMSFilamentBackup(context.Context, int) error {
 	return f.amsBackupErr
 }
 
-func (f *fakeController) setFanSpeed(_ context.Context, _ int, fan string, speed int) error {
+func (f *fakeController) setFanSpeed(ctx context.Context, _ int, fan string, speed int) error {
 	f.mu.Lock()
 	call := fanCall{fan: fan, speed: speed}
 	f.fanCalls = append(f.fanCalls, call)
@@ -131,9 +140,32 @@ func (f *fakeController) setFanSpeed(_ context.Context, _ int, fan string, speed
 		}
 	}
 	if block != nil {
-		<-block
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.gateStatuses {
+		var reported *int
+		switch fan {
+		case "aux":
+			reported = f.gateStatuses[i].AuxFanSpeed
+		case "chamber":
+			reported = f.gateStatuses[i].ChamberFanSpeed
+		case "aux2":
+			reported = f.gateStatuses[i].LeftAuxFanSpeed
+		}
+		if reported != nil {
+			*reported = speed
+		}
+	}
+	return nil
 }
 
 type fakeAssessor struct {
@@ -301,10 +333,10 @@ func TestFailedAndStoppedWebhooksCanReleaseClearGate(t *testing.T) {
 
 func TestSuccessfulCompletionRunsPostPrintFanCycle(t *testing.T) {
 	now := time.Now()
-	leftAuxSpeed := 0
+	auxSpeed, chamberSpeed, leftAuxSpeed := 0, 0, 0
 	gate := plateGateStatus{
-		ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf",
-		LeftAuxFanSpeed: &leftAuxSpeed,
+		ID: 7, Name: "P1S", Connected: true, AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf",
+		AuxFanSpeed: &auxSpeed, ChamberFanSpeed: &chamberSpeed, LeftAuxFanSpeed: &leftAuxSpeed,
 	}
 	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}
 	controller := &fakeController{
@@ -316,12 +348,29 @@ func TestSuccessfulCompletionRunsPostPrintFanCycle(t *testing.T) {
 	cfg := testConfig()
 	cfg.PostPrintFanDuration = time.Millisecond
 	cfg.PostPrintFanSpeed = 100
+	cfg.PostPrintFanStateFile = filepath.Join(t.TempDir(), "fan-cycles.json")
 	svc := newService(cfg, controller, &fakeAssessor{assessment: plateAssessment{PlateVisible: true, IsEmpty: true}}, log.New(io.Discard, "", 0))
+	svc.start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		svc.shutdown(ctx)
+	})
 	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
+	done := make(chan struct{})
+	go func() {
+		svc.fanWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fan cleanup did not finish")
+	}
 
 	select {
 	case <-controller.cleared:
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("successful completion was not released after the fan cycle")
 	}
 	want := []fanCall{
@@ -346,7 +395,11 @@ func TestSuccessfulCompletionRunsPostPrintFanCycle(t *testing.T) {
 
 func TestPostPrintFanFailureKeepsGateClosedAndStopsAttemptedFans(t *testing.T) {
 	now := time.Now()
-	gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"}
+	auxSpeed, chamberSpeed := 0, 0
+	gate := plateGateStatus{
+		ID: 7, Name: "P1S", Connected: true, AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf",
+		AuxFanSpeed: &auxSpeed, ChamberFanSpeed: &chamberSpeed,
+	}
 	controller := &fakeController{
 		cleared:      make(chan int, 1),
 		gateStatuses: []plateGateStatus{gate},
@@ -356,8 +409,25 @@ func TestPostPrintFanFailureKeepsGateClosedAndStopsAttemptedFans(t *testing.T) {
 	cfg := testConfig()
 	cfg.PostPrintFanDuration = time.Millisecond
 	cfg.PostPrintFanSpeed = 100
+	cfg.PostPrintFanStateFile = filepath.Join(t.TempDir(), "fan-cycles.json")
 	svc := newService(cfg, controller, &fakeAssessor{}, log.New(io.Discard, "", 0))
+	svc.start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		svc.shutdown(ctx)
+	})
 	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
+	done := make(chan struct{})
+	go func() {
+		svc.fanWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fan cleanup did not finish")
+	}
 
 	select {
 	case <-controller.cleared:
@@ -377,59 +447,6 @@ func TestPostPrintFanFailureKeepsGateClosedAndStopsAttemptedFans(t *testing.T) {
 		if controller.fanCalls[i] != want[i] {
 			t.Fatalf("fan call %d: got %+v want %+v", i, controller.fanCalls[i], want[i])
 		}
-	}
-}
-
-func TestFanCleanupOwnershipBlocksShutdownClaimUntilStopsFinish(t *testing.T) {
-	releaseStop := make(chan struct{})
-	controller := &fakeController{
-		fanBlocks:  map[fanCall]<-chan struct{}{{fan: "aux", speed: 0}: releaseStop},
-		fanStarted: make(chan fanCall, 8),
-	}
-	cfg := testConfig()
-	cfg.PostPrintFanDuration = time.Millisecond
-	cfg.PostPrintFanSpeed = 100
-	svc := newService(cfg, controller, &fakeAssessor{}, log.New(io.Discard, "", 0))
-	cycleDone := make(chan error, 1)
-	go func() { cycleDone <- svc.runPostPrintFanCycle(context.Background(), 7, false) }()
-
-	for {
-		select {
-		case call := <-controller.fanStarted:
-			if call == (fanCall{fan: "aux", speed: 0}) {
-				goto stopStarted
-			}
-		case <-time.After(time.Second):
-			close(releaseStop)
-			t.Fatal("fan cleanup did not start")
-		}
-	}
-
-stopStarted:
-	claimDone := make(chan struct{})
-	go func() {
-		svc.claimAllPostPrintFans()
-		close(claimDone)
-	}()
-	select {
-	case <-claimDone:
-		close(releaseStop)
-		t.Fatal("shutdown claimed fan ownership while worker cleanup was still in flight")
-	case <-time.After(20 * time.Millisecond):
-	}
-	close(releaseStop)
-	select {
-	case err := <-cycleDone:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("fan cycle did not finish after cleanup was released")
-	}
-	select {
-	case <-claimDone:
-	case <-time.After(time.Second):
-		t.Fatal("shutdown claim did not finish after fan cleanup")
 	}
 }
 
@@ -893,7 +910,11 @@ func TestChangedGateIsNotCleared(t *testing.T) {
 
 func TestDryRunExecutesAllSafetyChecks(t *testing.T) {
 	now := time.Now()
-	gate := plateGateStatus{ID: 7, Name: "P1S", AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf"}
+	auxSpeed, chamberSpeed := 0, 0
+	gate := plateGateStatus{
+		ID: 7, Name: "P1S", Connected: true, AwaitingPlateClear: true, State: "FINISH", SubtaskName: "part.3mf",
+		AuxFanSpeed: &auxSpeed, ChamberFanSpeed: &chamberSpeed,
+	}
 	terminal := terminalJob{ID: 42, Status: "completed", CompletedAt: now.Add(-time.Second)}
 	controller := &fakeController{
 		cleared:          make(chan int, 1),
@@ -909,11 +930,40 @@ func TestDryRunExecutesAllSafetyChecks(t *testing.T) {
 	}}
 	cfg := testConfig()
 	cfg.DryRun = true
-	cfg.PostPrintFanDuration = 5 * time.Minute
+	cfg.PostPrintFanDuration = 20 * time.Millisecond
 	cfg.PostPrintFanSpeed = 100
 	svc := newService(cfg, controller, assessor, log.New(io.Discard, "", 0))
+	svc.start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		svc.shutdown(ctx)
+	})
+	started := time.Now()
 	svc.processJob(context.Background(), plateJob{PrinterID: 7, Event: testEvent(now), EventTime: now})
 
+	controller.mu.Lock()
+	if controller.snapshotCalls != 0 {
+		controller.mu.Unlock()
+		t.Fatal("dry run did not honor the configured fan-cycle delay")
+	}
+	controller.mu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	for {
+		controller.mu.Lock()
+		finished := controller.snapshotCalls == 2 && controller.gateCalls >= 4 && controller.terminalCalls >= 4
+		controller.mu.Unlock()
+		if finished {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("dry-run continuation did not complete")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if time.Since(started) < cfg.PostPrintFanDuration {
+		t.Fatal("dry-run assessment resumed before the fan-cycle duration elapsed")
+	}
 	select {
 	case <-controller.cleared:
 		t.Fatal("dry run must not clear the gate")
@@ -921,7 +971,7 @@ func TestDryRunExecutesAllSafetyChecks(t *testing.T) {
 	}
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
-	if controller.snapshotCalls != 2 || controller.gateCalls != 2 || controller.terminalCalls != 2 {
+	if controller.snapshotCalls != 2 || controller.gateCalls != 4 || controller.terminalCalls != 4 {
 		t.Fatalf(
 			"dry run skipped checks: snapshots=%d gates=%d terminal_jobs=%d",
 			controller.snapshotCalls,
@@ -1135,6 +1185,10 @@ type schedulingController struct {
 
 func (c *schedulingController) snapshot(_ context.Context, printerID int) ([]byte, string, error) {
 	return []byte{0xff, 0xd8, 0xff, 0xdb, byte(printerID)}, "image/jpeg", nil
+}
+
+func (c *schedulingController) printerModel(context.Context, int) (string, error) {
+	return "P1S", nil
 }
 
 func (c *schedulingController) gateStatus(_ context.Context, printerID int) (plateGateStatus, error) {

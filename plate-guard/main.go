@@ -50,6 +50,12 @@ func main() {
 		httpClient:  &http.Client{Timeout: cfg.OpenAITimeout},
 	}
 	plateService := newService(cfg, bambuddy, openAI, logger)
+	fanRecoveryCtx, fanRecoveryCancel := context.WithTimeout(context.Background(), 4*cfg.BambuddyTimeout)
+	if err := plateService.recoverPostPrintFans(fanRecoveryCtx); err != nil {
+		fanRecoveryCancel()
+		logger.Fatalf("post-print fan recovery failed: %v", err)
+	}
+	fanRecoveryCancel()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -88,10 +94,11 @@ func main() {
 	cancel()
 
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	if !plateService.shutdown(drainCtx) {
-		logger.Printf("background queue drain timed out; remaining plate gates stay closed")
-	}
+	drained := plateService.shutdown(drainCtx)
 	drainCancel()
+	if !drained {
+		logger.Fatalf("background queue or fan cleanup did not finish safely; remaining plate gates stay closed")
+	}
 	if serverErr != nil {
 		logger.Fatalf("HTTP server failed: %v", serverErr)
 	}

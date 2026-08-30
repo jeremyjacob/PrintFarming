@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +24,7 @@ const (
 
 type plateController interface {
 	snapshot(context.Context, int) ([]byte, string, error)
+	printerModel(context.Context, int) (string, error)
 	gateStatus(context.Context, int) (plateGateStatus, error)
 	latestTerminalJob(context.Context, int) (terminalJob, error)
 	activeQueueJob(context.Context, int) (activeQueueJob, error)
@@ -48,34 +48,44 @@ type webhookEvent struct {
 }
 
 type plateJob struct {
-	PrinterID int
-	Event     webhookEvent
-	EventTime time.Time
+	PrinterID       int
+	Event           webhookEvent
+	EventTime       time.Time
+	AfterFanCycle   bool
+	AfterFanCleanup bool
 }
 
 type service struct {
-	controller           plateController
-	assessor             plateAssessor
-	logger               *log.Logger
-	webhookSecret        string
-	snapshotDelay        time.Duration
-	eventMaxAge          time.Duration
-	timezone             *time.Location
-	workerCount          int
-	enableAMSBackup      bool
-	postPrintFanDuration time.Duration
-	postPrintFanSpeed    int
-	dryRun               bool
-	jobs                 chan plateJob
-	jobSlots             chan struct{}
-	workerSlots          chan struct{}
-	queueMu              sync.RWMutex
-	accepting            bool
-	workerCancel         context.CancelFunc
-	workerWG             sync.WaitGroup
-	fanMu                sync.Mutex
-	activeFans           map[int][]string
-	fanShutdown          bool
+	controller            plateController
+	assessor              plateAssessor
+	logger                *log.Logger
+	webhookSecret         string
+	snapshotDelay         time.Duration
+	eventMaxAge           time.Duration
+	timezone              *time.Location
+	workerCount           int
+	enableAMSBackup       bool
+	postPrintFanDuration  time.Duration
+	postPrintFanSpeed     int
+	postPrintFanStateFile string
+	dryRun                bool
+	jobs                  chan plateJob
+	jobSlots              chan struct{}
+	workerSlots           chan struct{}
+	queueMu               sync.RWMutex
+	accepting             bool
+	workerCancel          context.CancelFunc
+	workerWG              sync.WaitGroup
+	fanMu                 sync.Mutex
+	fanPersistMu          sync.Mutex
+	fanContext            context.Context
+	fanCancel             context.CancelFunc
+	fanCycles             map[int]*fanCycle
+	fanRecords            map[int]fanCycleRecord
+	fanStopping           bool
+	fanDrainContext       context.Context
+	fanCleanupFailed      bool
+	fanWG                 sync.WaitGroup
 }
 
 func newService(cfg config, controller plateController, assessor plateAssessor, logger *log.Logger) *service {
@@ -84,22 +94,24 @@ func newService(cfg config, controller plateController, assessor plateAssessor, 
 		workerCount = 1
 	}
 	return &service{
-		controller:           controller,
-		assessor:             assessor,
-		logger:               logger,
-		webhookSecret:        cfg.WebhookSecret,
-		snapshotDelay:        cfg.SnapshotDelay,
-		eventMaxAge:          cfg.EventMaxAge,
-		timezone:             cfg.BambuddyTimezone,
-		workerCount:          workerCount,
-		enableAMSBackup:      cfg.EnableAMSBackup,
-		postPrintFanDuration: cfg.PostPrintFanDuration,
-		postPrintFanSpeed:    cfg.PostPrintFanSpeed,
-		dryRun:               cfg.DryRun,
-		jobs:                 make(chan plateJob, 256),
-		jobSlots:             make(chan struct{}, 256),
-		workerSlots:          make(chan struct{}, workerCount),
-		activeFans:           make(map[int][]string),
+		controller:            controller,
+		assessor:              assessor,
+		logger:                logger,
+		webhookSecret:         cfg.WebhookSecret,
+		snapshotDelay:         cfg.SnapshotDelay,
+		eventMaxAge:           cfg.EventMaxAge,
+		timezone:              cfg.BambuddyTimezone,
+		workerCount:           workerCount,
+		enableAMSBackup:       cfg.EnableAMSBackup,
+		postPrintFanDuration:  cfg.PostPrintFanDuration,
+		postPrintFanSpeed:     cfg.PostPrintFanSpeed,
+		postPrintFanStateFile: cfg.PostPrintFanStateFile,
+		dryRun:                cfg.DryRun,
+		jobs:                  make(chan plateJob, 256),
+		jobSlots:              make(chan struct{}, 256),
+		workerSlots:           make(chan struct{}, workerCount),
+		fanCycles:             make(map[int]*fanCycle),
+		fanRecords:            make(map[int]fanCycleRecord),
 	}
 }
 
@@ -126,7 +138,7 @@ func (s *service) handleReady(w http.ResponseWriter, r *http.Request) {
 	s.queueMu.RLock()
 	accepting := s.accepting
 	s.queueMu.RUnlock()
-	if !accepting || len(s.jobSlots) == cap(s.jobSlots) {
+	if !accepting || len(s.jobSlots) == cap(s.jobSlots) || !s.fanStateReady() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
 		return
 	}
@@ -177,7 +189,6 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "stale webhook timestamp"})
 		return
 	}
-
 	s.queueMu.RLock()
 	defer s.queueMu.RUnlock()
 	if !s.accepting {
@@ -193,6 +204,7 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	select {
 	case s.jobs <- plateJob{PrinterID: printerID, Event: event, EventTime: eventTime}:
+		s.cancelFanCycleForEvent(printerID, event, eventTime)
 		s.logger.Printf("accepted Bambuddy event=%q printer_id=%d printer=%q filename=%q", event.Event, printerID, event.Printer, event.Filename)
 		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 	default:
@@ -204,10 +216,18 @@ func (s *service) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 func (s *service) start(parent context.Context) {
 	ctx, cancel := context.WithCancel(parent)
+	fanCtx, fanCancel := context.WithCancel(parent)
 	s.queueMu.Lock()
 	s.workerCancel = cancel
 	s.accepting = true
 	s.queueMu.Unlock()
+	s.fanMu.Lock()
+	s.fanContext = fanCtx
+	s.fanCancel = fanCancel
+	s.fanStopping = false
+	s.fanDrainContext = nil
+	s.fanCleanupFailed = false
+	s.fanMu.Unlock()
 	s.workerWG.Add(1)
 	go s.dispatch(ctx)
 }
@@ -262,26 +282,23 @@ func (s *service) shutdown(ctx context.Context) bool {
 	close(s.jobs)
 	cancel := s.workerCancel
 	s.queueMu.Unlock()
+	s.stopFanCycles(ctx)
 
 	done := make(chan struct{})
 	go func() {
 		s.workerWG.Wait()
+		s.fanWG.Wait()
 		close(done)
 	}()
 	select {
 	case <-done:
-		return true
+		s.fanMu.Lock()
+		fanCleanupFailed := s.fanCleanupFailed
+		s.fanMu.Unlock()
+		return !fanCleanupFailed
 	case <-ctx.Done():
 		if cancel != nil {
 			cancel()
-		}
-		activeFans := s.claimAllPostPrintFans()
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cleanupCancel()
-		for printerID, fans := range activeFans {
-			if err := s.stopPostPrintFans(cleanupCtx, printerID, fans); err != nil {
-				s.logger.Printf("forced-shutdown fan cleanup failed printer_id=%d: %v", printerID, err)
-			}
 		}
 		return false
 	}
@@ -297,7 +314,7 @@ func (s *service) processJob(ctx context.Context, job plateJob) {
 }
 
 func (s *service) processCompletion(ctx context.Context, job plateJob) {
-	if time.Since(job.EventTime) > s.eventMaxAge {
+	if !job.AfterFanCycle && !job.AfterFanCleanup && time.Since(job.EventTime) > s.eventMaxAge {
 		s.logger.Printf("ignored stale queued event=%q printer_id=%d", job.Event.Event, job.PrinterID)
 		return
 	}
@@ -337,9 +354,18 @@ func (s *service) processCompletion(ctx context.Context, job plateJob) {
 		s.logger.Printf("plate remains gated printer_id=%d: webhook does not match latest terminal queue job", job.PrinterID)
 		return
 	}
-	if job.Event.Event == "print_complete" {
-		if err := s.runPostPrintFanCycle(ctx, job.PrinterID, initialGate.LeftAuxFanSpeed != nil); err != nil {
+	if job.Event.Event != "print_complete" {
+		if s.deferCanceledFanCycle(ctx, job) {
+			return
+		}
+	}
+	if job.Event.Event == "print_complete" && !job.AfterFanCycle {
+		scheduled, err := s.schedulePostPrintFanCycle(ctx, job, initialGate, initialTerminal)
+		if err != nil {
 			s.logger.Printf("plate remains gated printer_id=%d: post-print fan cycle failed: %v", job.PrinterID, err)
+			return
+		}
+		if scheduled {
 			return
 		}
 	}
@@ -395,95 +421,6 @@ func (s *service) processCompletion(ctx context.Context, job plateJob) {
 	s.logger.Printf("plate gate cleared printer_id=%d; Bambuddy may dispatch the next queued print", job.PrinterID)
 }
 
-func (s *service) runPostPrintFanCycle(ctx context.Context, printerID int, hasLeftAux bool) error {
-	if s.postPrintFanDuration <= 0 {
-		return nil
-	}
-	fans := []string{"aux", "chamber"}
-	if hasLeftAux {
-		fans = append(fans, "aux2")
-	}
-	if s.dryRun {
-		s.logger.Printf(
-			"dry run: would run post-print fan cycle printer_id=%d fans=%s speed=%d duration=%s",
-			printerID,
-			strings.Join(fans, ","),
-			s.postPrintFanSpeed,
-			s.postPrintFanDuration,
-		)
-		return nil
-	}
-
-	stopFans := func() error {
-		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-		defer cancel()
-		return s.stopRegisteredPostPrintFans(stopCtx, printerID)
-	}
-
-	for _, fan := range fans {
-		if err := s.startPostPrintFan(ctx, printerID, fan); err != nil {
-			return errors.Join(fmt.Errorf("start %s fan: %w", fan, err), stopFans())
-		}
-	}
-	s.logger.Printf(
-		"post-print fan cycle started printer_id=%d fans=%s speed=%d duration=%s",
-		printerID,
-		strings.Join(fans, ","),
-		s.postPrintFanSpeed,
-		s.postPrintFanDuration,
-	)
-
-	timer := time.NewTimer(s.postPrintFanDuration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return errors.Join(ctx.Err(), stopFans())
-	case <-timer.C:
-	}
-	if err := stopFans(); err != nil {
-		return err
-	}
-	s.logger.Printf("post-print fan cycle completed printer_id=%d fans=%s", printerID, strings.Join(fans, ","))
-	return nil
-}
-
-func (s *service) startPostPrintFan(ctx context.Context, printerID int, fan string) error {
-	s.fanMu.Lock()
-	defer s.fanMu.Unlock()
-	if s.fanShutdown {
-		return context.Canceled
-	}
-	s.activeFans[printerID] = append(s.activeFans[printerID], fan)
-	return s.controller.setFanSpeed(ctx, printerID, fan, s.postPrintFanSpeed)
-}
-
-func (s *service) stopRegisteredPostPrintFans(ctx context.Context, printerID int) error {
-	s.fanMu.Lock()
-	defer s.fanMu.Unlock()
-	fans := s.activeFans[printerID]
-	delete(s.activeFans, printerID)
-	return s.stopPostPrintFans(ctx, printerID, fans)
-}
-
-func (s *service) claimAllPostPrintFans() map[int][]string {
-	s.fanMu.Lock()
-	defer s.fanMu.Unlock()
-	s.fanShutdown = true
-	fans := s.activeFans
-	s.activeFans = make(map[int][]string)
-	return fans
-}
-
-func (s *service) stopPostPrintFans(ctx context.Context, printerID int, fans []string) error {
-	var stopErrors []error
-	for _, fan := range fans {
-		if err := s.controller.setFanSpeed(ctx, printerID, fan, 0); err != nil {
-			stopErrors = append(stopErrors, fmt.Errorf("stop %s fan: %w", fan, err))
-		}
-	}
-	return errors.Join(stopErrors...)
-}
-
 func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 	if time.Since(job.EventTime) > s.eventMaxAge {
 		s.logger.Printf("ignored stale first-layer event printer_id=%d", job.PrinterID)
@@ -505,6 +442,9 @@ func (s *service) processFirstLayer(ctx context.Context, job plateJob) {
 	}
 	if !activeJobMatchesEvent(initialJob, job.EventTime) {
 		s.logger.Printf("first-layer check skipped printer_id=%d: event predates the active queue job", job.PrinterID)
+		return
+	}
+	if s.deferCanceledFanCycle(ctx, job) {
 		return
 	}
 

@@ -10,7 +10,8 @@ The queue-release path fails closed:
 - Both OpenAI assessments must find the normal fixed-camera view usable and show no retained part or obstruction. A full view of every plate edge is not required.
 - Camera, OpenAI, Bambuddy, timeout, stale-event, and uncertain-result failures do not send a clear request.
 - It maps completed, failed, and stopped webhooks to their exact terminal queue statuses, then rechecks the same queue job and printer gate immediately before calling Bambuddy's `clear-plate` endpoint.
-- After a validated successful completion, it runs the auxiliary and chamber fans at full speed for five minutes, plus the left auxiliary fan when Bambuddy reports one. It stops the fans before image assessment and keeps the queue gated if the fan cycle fails.
+- After a validated successful completion, it runs each supported auxiliary/chamber fan at full speed for five minutes. Startup, acknowledgement, and the timer run outside the worker pool. Every fan command is cancellation-aware and preceded by gate/job ownership checks.
+- Active fan ownership is persisted before fan startup. On restart, Plate Guard stops and verifies orphaned fans only while the original terminal gate remains safe to control; changed or active-print ownership is relinquished without fan commands.
 
 The first-layer path is deliberately conservative against false pauses:
 
@@ -23,11 +24,11 @@ The first-layer path is deliberately conservative against false pauses:
 - After a completed review does not confirm a failure, it repeats the same active-print checks and enables AMS Filament Backup through Bambuddy's printer API. It does not enable backup for a confirmed failure, an expired event, or a print that changed during review.
 - It never stops, resumes, or starts a printer directly.
 
-Bambuddy 1.2.5 does not provide atomic "clear this exact gate generation" or "pause this exact print generation" operations. A manual action can theoretically change printer state between a final status check and its control request. Do not manually clear a gate or replace/resume a print while Plate Guard is processing the corresponding webhook.
+Bambuddy 1.2.5 does not provide atomic "control this exact print/gate generation" operations. Plate Guard cancels in-flight fan requests when a newer accepted webhook arrives and rechecks ownership before each command, but a manual action can still change printer state in the narrow interval between a final check and delivery. Do not manually clear a gate or replace/resume a print while Plate Guard is processing the corresponding webhook.
 
 ## Requirements
 
-- Bambuddy 1.2.5 or newer
+- Bambuddy 1.2.5 or newer; P2S/X2D accessory-fan detection and optional left-aux (`aux2`) control require 1.2.5.2 or newer
 - A usable Bambuddy camera snapshot endpoint
 - An OpenAI API key with Responses API access to `gpt-5.6-sol`
 - Go 1.22 or newer when building from source
@@ -59,13 +60,14 @@ Configuration is read from environment variables.
 | `WEBHOOK_SECRET` | Yes | - | Shared bearer token for incoming webhooks |
 | `LISTEN_ADDR` | No | `127.0.0.1:8787` | HTTP listen address |
 | `BAMBUDDY_TIMEZONE` | No | `UTC` | IANA timezone for Bambuddy's offset-free webhook timestamps |
-| `EVENT_MAX_AGE` | No | `5m` | Maximum webhook and queued-job age |
+| `EVENT_MAX_AGE` | No | `5m` | Maximum webhook age when external work is accepted; validated fan continuations are exempt |
 | `SNAPSHOT_DELAY` | No | `5s` | Delay before the first fresh snapshot |
 | `WORKER_COUNT` | No | `4` | Concurrent workers; jobs for one printer remain serialized |
 | `AUTO_ENABLE_PLATE_CLEAR` | No | `true` | Attempt to enable `require_plate_clear` during startup |
 | `ENABLE_AMS_BACKUP_AFTER_FIRST_LAYER` | No | `true` | Enable AMS Filament Backup after a completed first-layer review does not confirm a failure |
-| `POST_PRINT_FAN_DURATION` | No | `5m` | Successful-completion fan-cycle duration; `0s` disables it |
-| `POST_PRINT_FAN_SPEED` | No | `100` | Auxiliary, chamber, and optional left-aux fan speed from 1 to 100 percent |
+| `POST_PRINT_FAN_DURATION` | No | `5m` | Successful-completion fan-cycle duration from `0s` (disabled) through `1h` |
+| `POST_PRINT_FAN_SPEED` | No | `100` | Auxiliary, chamber, and optional left-aux fan speed from 4 to 100 percent |
+| `POST_PRINT_FAN_STATE_FILE` | No | `/var/lib/bambuddy-plate-guard/fan-cycles.json` | Durable active-cycle state used for restart cleanup |
 | `DRY_RUN` | No | `false` | Analyze and revalidate without sending fan, pause, AMS-backup, or `clear-plate` requests |
 | `BAMBUDDY_TIMEOUT` | No | `15s` | Timeout for each Bambuddy request |
 | `OPENAI_TIMEOUT` | No | `60s` | Timeout for each OpenAI request |
@@ -87,6 +89,8 @@ set -a
 set +a
 go run .
 ```
+
+For a non-root local run, set `POST_PRINT_FAN_STATE_FILE` to a writable absolute path or set `POST_PRINT_FAN_DURATION=0s`. The systemd unit creates and protects the default `/var/lib/bambuddy-plate-guard` directory automatically.
 
 Set `BAMBUDDY_TIMEZONE` to the Bambuddy process or container's timezone when it is not UTC, for example `America/Los_Angeles`. This may differ from the Docker host's timezone. Bambuddy 1.2.5 emits offset-free webhook timestamps but stores queue completion timestamps in UTC; the correct setting is required to bind them safely.
 
@@ -129,7 +133,11 @@ POST /api/v1/printers/{printer_id}/ams-backup?enabled=true
 
 Set `ENABLE_AMS_BACKUP_AFTER_FIRST_LAYER=false` to disable this behavior. This is a per-printer control request; Plate Guard revalidates the active printer and queue job immediately before sending it.
 
-For a matching `print_complete` event, Plate Guard keeps the queue gated while it calls `POST /api/v1/printers/{printer_id}/fan-speed` for `aux` and `chamber`, and for `aux2` when `left_aux_fan_speed` is present in printer status. It sets each fan to `POST_PRINT_FAN_SPEED`, waits `POST_PRINT_FAN_DURATION`, sets each attempted fan to zero, and only then begins empty-plate assessment. Failed and stopped prints do not run this cycle. A startup or cleanup error holds the gate for manual review.
+For a matching `print_complete` event, Plate Guard keeps the queue gated while it calls `POST /api/v1/printers/{printer_id}/fan-speed` for the fans Bambuddy reports through `big_fan1_speed` (`aux`), `big_fan2_speed` (`chamber`), and `left_aux_fan_speed` (`aux2`). P2S/X2D chamber control additionally requires `exhaust_fan_present=true`. It persists ownership, sets each fan to `POST_PRINT_FAN_SPEED`, accepts Bambuddy's quantized speed acknowledgement, and only then starts the asynchronous `POST_PRINT_FAN_DURATION` timer. Fan setup and the wait do not consume worker slots.
+
+At expiry, Plate Guard rechecks ownership before every fan-off request, stops and verifies the fans, then queues empty-plate assessment. A newer accepted lifecycle event cancels the old timer and any in-flight fan request. `PREPARE`, `SLICING`, `RUNNING`, and `PAUSE` all identify an active replacement; Plate Guard relinquishes ownership without issuing further fan commands. Failed/stopped prints never start a cycle and cannot clear their gate until older fan cleanup finishes. Cleanup retries while the service is running, and a shutdown cleanup failure leaves the durable record intact and exits unsuccessfully for recovery on restart.
+
+`DRY_RUN=true` waits for the configured duration and exercises revalidation and assessment timing without sending fan commands. If live fan ownership was persisted by an earlier run, dry-run startup refuses to proceed rather than silently issuing cleanup commands; restart once with `DRY_RUN=false` or stop the recorded fans manually.
 
 Bambuddy 1.2.5 does not consistently enforce an API key's printer allowlist on these routes. Treat the API key as able to read and clear all printers until that is fixed upstream, keep the webhook secret private, and firewall the listener to Bambuddy's network.
 
@@ -200,7 +208,7 @@ curl http://127.0.0.1:8787/healthz
 curl http://127.0.0.1:8787/readyz
 ```
 
-The unit uses a dynamic unprivileged user, a read-only filesystem, no Linux capabilities, and systemd hardening. It writes operational output only to the journal.
+The unit uses a dynamic unprivileged user, a read-only filesystem, no Linux capabilities, and systemd hardening. systemd provides the private writable state directory used only for active fan-cycle recovery; startup verifies that this directory is writable before enabling live fan control. Operational output goes to the journal.
 
 ## Safe Commissioning
 
@@ -208,10 +216,10 @@ The unit uses a dynamic unprivileged user, a read-only filesystem, no Linux capa
 2. Start the service and send Bambuddy's webhook provider test.
 3. If the gate was enabled after a print had already finished, clear that pre-existing gate manually; it has no webhook for the daemon to process.
 4. Run a first-layer test and inspect the specialized classification and final active-print revalidation in the journal. Confirm that `DRY_RUN=true` neither pauses it nor changes AMS Filament Backup.
-5. Complete an ejection test print and inspect the five-minute fan cycle, both empty-plate classifications, and the final gate/job revalidation.
+5. Complete an ejection test print and confirm dry-run waits five minutes without changing fans, then inspect both empty-plate classifications and the final gate/job revalidation.
 6. Confirm the plate-clear gate remains active in Bambuddy, then clear it manually.
 7. Set `DRY_RUN=false` and restart the service.
-8. Test a healthy first layer and confirm AMS Filament Backup becomes enabled, then test a clearly failed first layer, successful ejection, an occupied plate, an obscured or dark camera, and a deliberately failed OpenAI request before loading a production queue.
+8. Test a healthy first layer and confirm AMS Filament Backup becomes enabled, then test a clearly failed first layer, the live fan cycle, successful ejection, an occupied plate, an obscured or dark camera, and a deliberately failed OpenAI request before loading a production queue.
 
 ```bash
 sudo systemctl restart bambuddy-plate-guard
@@ -221,15 +229,15 @@ If an assessment holds a plate, remove the obstruction and use Bambuddy's normal
 
 If Plate Guard pauses a first-layer failure, inspect the print and use Bambuddy's normal stop or resume control. Plate Guard never resumes automatically.
 
-If a fan, pause, AMS-backup, or `clear-plate` request times out after delivery, the result is inherently unknown: Bambuddy may have processed it before the response was lost. Plate Guard logs this case explicitly and attempts to stop every fan whose startup was attempted.
+If a fan, pause, AMS-backup, or `clear-plate` request times out after delivery, the result is inherently unknown: Bambuddy may have processed it before the response was lost. Plate Guard logs this case explicitly and retries safe fan cleanup while it still owns the terminal gate. It does not issue further fan commands after ownership changes to a replacement print.
 
 ## HTTP Endpoints
 
 - `GET /healthz`: worker lifecycle/liveness status
-- `GET /readyz`: accepting-work, queue-capacity, Bambuddy-connectivity, and gate-setting check
+- `GET /readyz`: accepting-work, queue-capacity, fan-recovery ownership, Bambuddy-connectivity, and gate-setting check
 - `POST /webhooks/bambuddy/{printer_id}`: authenticated Bambuddy notification receiver
 
-The webhook handler acknowledges quickly and performs analysis in a 256-entry bounded background queue. Each printer has an ordered serial queue, while `WORKER_COUNT` limits concurrent processing across different printers. A backlog for one printer does not occupy the other printer workers. During shutdown, new work is rejected and accepted work drains for up to `SHUTDOWN_TIMEOUT`.
+The webhook handler acknowledges quickly and performs analysis in a 256-entry bounded background queue. Each printer has an ordered serial queue, while `WORKER_COUNT` limits concurrent active processing across different printers. Fan startup, timers, cleanup, and cleanup-dependent lifecycle waits run outside the worker pool, so several cooling or reconciling printers cannot starve unrelated first-layer or terminal events. During shutdown, new work is rejected, fan timers are cancelled and reconciled immediately, and accepted work drains for up to `SHUTDOWN_TIMEOUT`.
 
 ## Releases
 

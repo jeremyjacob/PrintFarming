@@ -38,7 +38,10 @@ type plateGateStatus struct {
 	SubtaskName        string `json:"subtask_name"`
 	GcodeFile          string `json:"gcode_file"`
 	LayerNum           int    `json:"layer_num"`
+	AuxFanSpeed        *int   `json:"big_fan1_speed"`
+	ChamberFanSpeed    *int   `json:"big_fan2_speed"`
 	LeftAuxFanSpeed    *int   `json:"left_aux_fan_speed"`
+	ExhaustFanPresent  bool   `json:"exhaust_fan_present"`
 }
 
 type terminalJob struct {
@@ -225,6 +228,33 @@ func (c *bambuddyClient) gateStatus(ctx context.Context, printerID int) (plateGa
 		return plateGateStatus{}, fmt.Errorf("decode Bambuddy plate gate status: %w", err)
 	}
 	return status, nil
+}
+
+func (c *bambuddyClient) printerModel(ctx context.Context, printerID int) (string, error) {
+	path := "/api/v1/printers/" + strconv.Itoa(printerID)
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("get Bambuddy printer model: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", responseError("get Bambuddy printer model", resp)
+	}
+	var printer struct {
+		ID    int    `json:"id"`
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBambuddyResponseBytes)).Decode(&printer); err != nil {
+		return "", fmt.Errorf("decode Bambuddy printer model: %w", err)
+	}
+	if printer.ID != printerID || strings.TrimSpace(printer.Model) == "" {
+		return "", fmt.Errorf("Bambuddy returned an invalid printer model for printer %d", printerID)
+	}
+	return printer.Model, nil
 }
 
 func (c *bambuddyClient) latestTerminalJob(ctx context.Context, printerID int) (terminalJob, error) {

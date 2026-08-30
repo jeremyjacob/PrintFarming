@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -10,48 +11,50 @@ import (
 )
 
 type config struct {
-	ListenAddr           string
-	BambuddyURL          string
-	BambuddyAPIKey       string
-	OpenAIAPIKey         string
-	OpenAIBaseURL        string
-	OpenAIModel          string
-	OpenAIImageDetail    string
-	WebhookSecret        string
-	SnapshotDelay        time.Duration
-	EventMaxAge          time.Duration
-	BambuddyTimezone     *time.Location
-	WorkerCount          int
-	ShutdownTimeout      time.Duration
-	AutoEnablePlateClear bool
-	EnableAMSBackup      bool
-	PostPrintFanDuration time.Duration
-	PostPrintFanSpeed    int
-	DryRun               bool
-	BambuddyTimeout      time.Duration
-	OpenAITimeout        time.Duration
+	ListenAddr            string
+	BambuddyURL           string
+	BambuddyAPIKey        string
+	OpenAIAPIKey          string
+	OpenAIBaseURL         string
+	OpenAIModel           string
+	OpenAIImageDetail     string
+	WebhookSecret         string
+	SnapshotDelay         time.Duration
+	EventMaxAge           time.Duration
+	BambuddyTimezone      *time.Location
+	WorkerCount           int
+	ShutdownTimeout       time.Duration
+	AutoEnablePlateClear  bool
+	EnableAMSBackup       bool
+	PostPrintFanDuration  time.Duration
+	PostPrintFanSpeed     int
+	PostPrintFanStateFile string
+	DryRun                bool
+	BambuddyTimeout       time.Duration
+	OpenAITimeout         time.Duration
 }
 
 func loadConfig() (config, error) {
 	cfg := config{
-		ListenAddr:           envOrDefault("LISTEN_ADDR", "127.0.0.1:8787"),
-		BambuddyURL:          strings.TrimRight(os.Getenv("BAMBUDDY_URL"), "/"),
-		BambuddyAPIKey:       os.Getenv("BAMBUDDY_API_KEY"),
-		OpenAIAPIKey:         os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:        strings.TrimRight(envOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
-		OpenAIModel:          envOrDefault("OPENAI_MODEL", "gpt-5.6-sol"),
-		OpenAIImageDetail:    envOrDefault("OPENAI_IMAGE_DETAIL", "high"),
-		WebhookSecret:        os.Getenv("WEBHOOK_SECRET"),
-		SnapshotDelay:        5 * time.Second,
-		EventMaxAge:          5 * time.Minute,
-		WorkerCount:          4,
-		ShutdownTimeout:      5 * time.Minute,
-		AutoEnablePlateClear: true,
-		EnableAMSBackup:      true,
-		PostPrintFanDuration: 5 * time.Minute,
-		PostPrintFanSpeed:    100,
-		BambuddyTimeout:      15 * time.Second,
-		OpenAITimeout:        60 * time.Second,
+		ListenAddr:            envOrDefault("LISTEN_ADDR", "127.0.0.1:8787"),
+		BambuddyURL:           strings.TrimRight(os.Getenv("BAMBUDDY_URL"), "/"),
+		BambuddyAPIKey:        os.Getenv("BAMBUDDY_API_KEY"),
+		OpenAIAPIKey:          os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:         strings.TrimRight(envOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"), "/"),
+		OpenAIModel:           envOrDefault("OPENAI_MODEL", "gpt-5.6-sol"),
+		OpenAIImageDetail:     envOrDefault("OPENAI_IMAGE_DETAIL", "high"),
+		WebhookSecret:         os.Getenv("WEBHOOK_SECRET"),
+		SnapshotDelay:         5 * time.Second,
+		EventMaxAge:           5 * time.Minute,
+		WorkerCount:           4,
+		ShutdownTimeout:       5 * time.Minute,
+		AutoEnablePlateClear:  true,
+		EnableAMSBackup:       true,
+		PostPrintFanDuration:  5 * time.Minute,
+		PostPrintFanSpeed:     100,
+		PostPrintFanStateFile: "/var/lib/bambuddy-plate-guard/fan-cycles.json",
+		BambuddyTimeout:       15 * time.Second,
+		OpenAITimeout:         60 * time.Second,
 	}
 
 	var err error
@@ -85,6 +88,7 @@ func loadConfig() (config, error) {
 	if cfg.PostPrintFanSpeed, err = envInt("POST_PRINT_FAN_SPEED", cfg.PostPrintFanSpeed); err != nil {
 		return config{}, err
 	}
+	cfg.PostPrintFanStateFile = envOrDefault("POST_PRINT_FAN_STATE_FILE", cfg.PostPrintFanStateFile)
 	if cfg.DryRun, err = envBool("DRY_RUN", false); err != nil {
 		return config{}, err
 	}
@@ -110,11 +114,14 @@ func loadConfig() (config, error) {
 	if cfg.EventMaxAge <= 0 {
 		return config{}, fmt.Errorf("EVENT_MAX_AGE must be greater than zero")
 	}
-	if cfg.PostPrintFanDuration < 0 {
-		return config{}, fmt.Errorf("POST_PRINT_FAN_DURATION cannot be negative")
+	if cfg.PostPrintFanDuration < 0 || cfg.PostPrintFanDuration > time.Hour {
+		return config{}, fmt.Errorf("POST_PRINT_FAN_DURATION must be between 0s and 1h")
 	}
-	if cfg.PostPrintFanDuration > 0 && (cfg.PostPrintFanSpeed < 1 || cfg.PostPrintFanSpeed > 100) {
-		return config{}, fmt.Errorf("POST_PRINT_FAN_SPEED must be between 1 and 100 when the fan cycle is enabled")
+	if cfg.PostPrintFanDuration > 0 && (cfg.PostPrintFanSpeed < 4 || cfg.PostPrintFanSpeed > 100) {
+		return config{}, fmt.Errorf("POST_PRINT_FAN_SPEED must be between 4 and 100 when the fan cycle is enabled")
+	}
+	if cfg.PostPrintFanStateFile == "" || !filepath.IsAbs(cfg.PostPrintFanStateFile) {
+		return config{}, fmt.Errorf("POST_PRINT_FAN_STATE_FILE must be an absolute path")
 	}
 	if cfg.ShutdownTimeout <= 0 || cfg.ShutdownTimeout > 5*time.Minute {
 		return config{}, fmt.Errorf("SHUTDOWN_TIMEOUT must be greater than zero and at most 5m")
